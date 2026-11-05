@@ -1,0 +1,99 @@
+VeloFrame License
+Version 1.0
+
+Copyright (c) 2026 LiGLP Studios. All rights reserved.
+
+This license governs the use of the VeloFrame software, including its source
+code, binaries, documentation, logos and all associated files (the "Software").
+
+1. DEFINITIONS
+
+   "Licensor" means LiGLP Studios.
+
+   "You" means the individual or legal entity using the Software.
+
+   "Open-Source Project" means a project whose complete source code is
+   publicly available free of charge under a license approved by the Open
+   Source Initiative (https://opensource.org/licenses).
+
+   "Commercial Use" means any use of the Software, in whole or in part, that
+   (a) takes place in or for a business, company, organization or other
+       commercial activity, or
+   (b) is part of, bundled with, or used by a product, application, service
+       or website that is not an Open-Source Project, regardless of whether
+       that product is sold, offered free of charge, financed by
+       advertising, subscriptions or in-app purchases.
+
+2. PERMITTED USE WITHOUT A COMMERCIAL LICENSE
+
+   Subject to the conditions of this license, You may use, copy, modify and
+   build the Software free of charge for:
+
+   (a) personal, private and non-commercial purposes;
+   (b) education, research and evaluation;
+   (c) Open-Source Projects, provided that this license and the copyright
+       notice remain intact and LiGLP Studios is credited as the author of
+       VeloFrame.
+
+3. COMMERCIAL USE REQUIRES A LICENSE
+
+   Any Commercial Use requires a separate written license from LiGLP Studios
+   before such use begins. This applies in particular to embedding the
+   Software in closed-source or proprietary applications, products or
+   services.
+
+   To request a commercial license, contact: business@liglp.de
+
+4. RESTRICTIONS
+
+   Unless expressly permitted in a written agreement with LiGLP Studios,
+   You may not:
+
+   (a) sell, resell, rent, lease, sublicense or otherwise distribute the
+       Software, or any modified version of it, for a fee or as a
+       commercial product of its own;
+   (b) offer the Software, or a product whose main value is the Software,
+       as a competing screenshot, recording or capture engine;
+   (c) remove or alter copyright notices, this license, the name
+       "VeloFrame" or the LiGLP Studios attribution;
+   (d) use the names "VeloFrame" or "LiGLP Studios" or their logos to
+       endorse or promote products without prior written permission.
+
+5. REDISTRIBUTION
+
+   When You distribute the Software or a modified version of it under
+   section 2, You must include this license in full and state clearly
+   which changes You made.
+
+6. CONTRIBUTIONS
+
+   By submitting contributions (code, documentation or other material) to
+   the official VeloFrame repository, You grant LiGLP Studios a perpetual,
+   worldwide, royalty-free right to use, modify and license those
+   contributions, including under commercial licenses.
+
+7. TERMINATION
+
+   Any use in violation of this license automatically terminates all rights
+   granted under it. LiGLP Studios reserves all rights not expressly
+   granted.
+
+8. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+9. LIMITATION OF LIABILITY
+
+   TO THE EXTENT PERMITTED BY LAW, IN NO EVENT SHALL LIGLP STUDIOS BE LIABLE
+   FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH
+   THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. Liability for
+   intent and gross negligence under applicable law remains unaffected.
+
+10. GOVERNING LAW
+
+   This license is governed by the laws of the Federal Republic of Germany.
+
+Contact for licensing: business@liglp.de

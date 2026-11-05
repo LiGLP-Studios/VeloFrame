@@ -135,3 +135,9 @@ The encoder helper threads run at lower priority: when other programs (or a game
 - Clipboard: the image in it (8 MB at 1920×1080) belongs to the program that put it there until something else is copied. That is the same for every screenshot tool.
 - The last screenshot stays in memory for `copy` and as a reusable buffer (6 MB).
 - CPU when idle: 0.00 % (no background polling). GPU memory: 16 MB dedicated, 23 MB shared. No memory leak: 20 more screenshots change usage by less than 1 MB.
+
+## License
+
+VeloFrame is free for personal, educational and open-source use. **Commercial use** — in a business or in any app, product or service that is not open source — **requires a license from LiGLP Studios**. Reselling the engine is not permitted. See [LICENSE](LICENSE).
+
+Licensing: [business@liglp.de](mailto:business@liglp.de)
