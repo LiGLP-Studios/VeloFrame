@@ -1,0 +1,7 @@
+[package]
+name = "veloframe-linux"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+veloframe-core = { path = "../core" }

@@ -1,0 +1,15 @@
+[package]
+name = "veloframe-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+veloframe = { path = "../engine" }
+veloframe-core.workspace = true
+jpeg-encoder.workspace = true
+png.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+veloframe-win = { path = "../Win" }

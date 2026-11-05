@@ -1,0 +1,1 @@
+//! Aufnahme über ScreenCaptureKit.

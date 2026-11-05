@@ -1,0 +1,27 @@
+[package]
+name = "veloframe"
+version.workspace = true
+edition.workspace = true
+description = "VeloFrame: Screenshot- und Video-Engine zum Einbetten in Programme."
+
+[lib]
+name = "veloframe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "veloframe"
+path = "src/main.rs"
+
+[dependencies]
+veloframe-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+veloframe-win = { path = "../Win" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+veloframe-mac = { path = "../Mac" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+veloframe-linux = { path = "../Linux" }

@@ -1,0 +1,15 @@
+[package]
+name = "veloframe-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+jpeg-encoder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+simd-adler32.workspace = true
+
+[dev-dependencies]
+jpeg-decoder = "0.3"
+png.workspace = true

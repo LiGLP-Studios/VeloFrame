@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["core", "engine", "Win", "Mac", "Linux", "bench"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+
+[workspace.dependencies]
+veloframe-core = { path = "core" }
+jpeg-encoder = { version = "0.7.1", features = ["simd"] } # AVX2, wenn die CPU es hat (zur Laufzeit geprüft)
+png = "0.18.1"
+crc32fast = "1.5.0"
+simd-adler32 = "0.3.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

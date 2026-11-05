@@ -1,0 +1,7 @@
+[package]
+name = "veloframe-mac"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+veloframe-core = { path = "../core" }
