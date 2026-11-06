@@ -9,18 +9,23 @@
 //!
 //! Die CPU fasst dabei kein einziges Pixel an. Screenshots desselben Bildschirms während der Aufnahme
 //! kommen aus diesem Bild (`RecorderTap`), ohne zweite Aufnahme.
+//!
+//! Ton läuft in einem eigenen Thread (`audio.rs`) auf derselben Uhr: Beide zählen ab demselben
+//! QPC-Ursprung. Beim Speichern kommen die Tonpakete dazu, die genau die Zeit des Videos abdecken.
 
+use crate::audio::{AudioRecorder, Clock, qpc_now, qpc_to_ticks};
 use crate::duplication::FrameTap;
 use crate::encode::{HardwareEncoder, hardware_available};
 use crate::video::{Converter, Gpu, ScreenGrabber, find_output};
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use veloframe_core::audio::{AudioSetRequest, AudioStatus, aac_lc_config, clip_range};
 use veloframe_core::clip::{self, BufferRequest, BufferStatus, ClipResult, EncoderPlan, SaveClipRequest, Storage, VideoCodec};
-use veloframe_core::mp4::{TICKS_PER_SECOND, write_mp4};
+use veloframe_core::mp4::{AudioTrack, Packet, TICKS_PER_SECOND, VideoTrack, write_mp4};
 use veloframe_core::replay::{FileStore, RamStore, ReplayBuffer, Store};
 use veloframe_core::screenshot::create_unique_file;
 use veloframe_core::frame::{BgraView, Rotation};
@@ -70,6 +75,9 @@ pub struct Recorder {
     plan: EncoderPlan,
     screen: Rect,
     frames: mpsc::Sender<FrameRequest>,
+    audio: Option<AudioRecorder>,
+    /// Warum der Ton nicht läuft, obwohl er geplant war (das Video läuft trotzdem).
+    audio_error: Option<String>,
 }
 
 /// Alles, was der Aufnahme-Thread besitzt (D3D und Media Foundation bleiben auf diesem Thread).
@@ -211,11 +219,14 @@ fn feed(encoder: &mut HardwareEncoder, pending: &mut VecDeque<(windows::Win32::M
     Ok(())
 }
 
-fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<FrameRequest>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shared>>) {
+#[allow(clippy::too_many_arguments)]
+fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<FrameRequest>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shared>>, origin: i64, lag: Arc<AtomicI64>) {
     let _timer = TimerResolution::begin();
     let _mmcss = MmcssCapture::join();
     let period = Duration::from_secs_f64(1.0 / plan.fps as f64);
     let start = Instant::now();
+    // Bildzeiten auf der gemeinsamen Uhr mit dem Ton (Instant misst unter Windows ebenfalls mit QPC).
+    let offset = qpc_now() - origin;
     let mut frame: u64 = 0;
     let mut encoded = 0u64;
     let (mut busy, mut pool_full, mut late) = (0u64, 0u64, 0u64);
@@ -227,6 +238,7 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
     let mut calm_windows = 0u32;
     let mut error: Option<String> = None;
     let mut pending = VecDeque::with_capacity(MAX_PENDING + 1);
+    let mut lag_samples = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
         // Bis zum nächsten Bildzeitpunkt in kleinen Schritten den Encoder bedienen: Pakete abholen,
@@ -253,6 +265,20 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
 
         let step = (|| -> Result<()> {
             p.grabber.grab()?;
+            if p.grabber.fresh {
+                // Wie alt das Bild beim Abholen ist (sein Zeitstempel minus Anzeigezeit). Gleitend
+                // gemittelt über etwa 2 s bei 60 fps: Der Ton liegt um so viel später, damit beide
+                // zusammenpassen, und verschiebt sich dabei nie sprunghaft (höchstens ~2 ms/s, was
+                // die Drift-Korrektur unhörbar nachführt).
+                let age = origin + offset + pts(frame, plan.fps) - qpc_to_ticks(p.grabber.last_present);
+                if (0..4 * TICKS_PER_SECOND / plan.fps as i64).contains(&age) {
+                    // Die ersten 32 Bilder rasten schnell ein, danach nur noch langsam nachführen.
+                    let current = lag.load(Ordering::Relaxed);
+                    let weight = if lag_samples < 32 { 8 } else { 128 };
+                    lag.store(current + (age - current) / weight, Ordering::Relaxed);
+                    lag_samples += 1;
+                }
+            }
             // Screenshot-Wünsche bedienen, bevor das Bild weiterläuft.
             while let Ok(request) = frames.try_recv() {
                 let FrameRequest { region, mut image, reply } = request;
@@ -269,7 +295,7 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
                 Some((sample, texture, slice)) => {
                     p.converter.convert(&latest, &texture, slice)?;
                     let time = pts(frame, plan.fps);
-                    pending.push_back((sample, time, pts(frame + 1, plan.fps) - time));
+                    pending.push_back((sample, offset + time, pts(frame + 1, plan.fps) - time));
                     if pending.len() > MAX_PENDING {
                         // Der Encoder kommt dauerhaft nicht hinterher: ältestes wartendes Bild verwerfen.
                         pending.pop_front();
@@ -353,13 +379,16 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
 
 impl Recorder {
     pub fn start(request: &BufferRequest) -> Result<Self> {
+        let origin = qpc_now();
+        // Bis gemessen ist, wie alt ein Bild beim Abholen ist: eine halbe Bilddauer.
+        let lag = Arc::new(AtomicI64::new(TICKS_PER_SECOND / (2 * request.fps.max(1) as i64)));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Mutex::new(Shared { buffer: None, status: BufferStatus::default() }));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(EncoderPlan, Rect)>>();
         let (frames_tx, frames_rx) = mpsc::channel::<FrameRequest>();
         let request = request.clone();
         let thread = {
-            let (stop, shared) = (stop.clone(), shared.clone());
+            let (stop, shared, lag) = (stop.clone(), shared.clone(), lag.clone());
             std::thread::Builder::new()
                 .name("veloframe-video".into())
                 .spawn(move || match setup(&request) {
@@ -376,7 +405,7 @@ impl Recorder {
                             };
                         }
                         let _ = ready_tx.send(Ok((plan.clone(), screen)));
-                        run(pipeline, plan, screen, frames_rx, stop, shared);
+                        run(pipeline, plan, screen, frames_rx, stop, shared, origin, lag);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -385,7 +414,26 @@ impl Recorder {
                 .map_err(|e| Error::Capture(format!("Aufnahme-Thread: {e}")))?
         };
         let (plan, screen) = ready_rx.recv().map_err(|_| Error::Capture("Aufnahme-Thread ist beim Start abgestürzt.".into()))??;
-        Ok(Self { stop, shared, thread: Some(thread), plan, screen, frames: frames_tx })
+        // Ton: Fehlt er (z. B. kein AAC-Encoder unter Windows N), läuft das Video trotzdem.
+        let (audio, audio_error) = match &plan.audio {
+            Some(audio_plan) => {
+                // So weit zurück wie das Video: Fenster + ein GOP (Clips beginnen am Keyframe davor).
+                let seconds = plan.seconds + plan.gop_frames.div_ceil(plan.fps) + 2;
+                match AudioRecorder::start(audio_plan, Clock { origin, lag }, seconds) {
+                    Ok(audio) => (Some(audio), None),
+                    Err(e) => (None, Some(e.to_string())),
+                }
+            }
+            None => (None, None),
+        };
+        Ok(Self { stop, shared, thread: Some(thread), plan, screen, frames: frames_tx, audio, audio_error })
+    }
+
+    /// Lautstärke oder Stummschaltung des Tons ändern, während der Puffer läuft.
+    pub fn set_audio(&self, request: &AudioSetRequest) -> Result<AudioStatus> {
+        let audio = self.audio.as_ref().ok_or_else(|| Error::InvalidRequest("Der Clip-Puffer nimmt keinen Ton auf.".into()))?;
+        audio.set(request)?;
+        Ok(audio.status())
     }
 
     /// Zugang für Screenshots aus dem laufenden Bild (für `DesktopDuplication::set_tap`).
@@ -396,6 +444,11 @@ impl Recorder {
     pub fn status(&self) -> BufferStatus {
         let mut status = self.shared.lock().unwrap().status.clone();
         status.running = self.thread.as_ref().is_some_and(|t| !t.is_finished());
+        status.audio = match (&self.audio, &self.audio_error) {
+            (Some(audio), _) => Some(audio.status()),
+            (None, Some(error)) => Some(AudioStatus { error: Some(error.clone()), ..Default::default() }),
+            (None, None) => None,
+        };
         status
     }
 
@@ -411,14 +464,54 @@ impl Recorder {
             let buffer = guard.buffer.as_ref().ok_or_else(|| Error::InvalidRequest("Der Clip-Puffer läuft nicht.".into()))?;
             buffer.snapshot(request.seconds).map_err(|e| Error::Save(e.to_string()))?
         };
+        let infos = &snapshot.packets.infos;
+        let video_start = infos.iter().map(|i| i.pts).min().unwrap_or(0);
+        let video_end = infos.iter().map(|i| i.pts + i.duration).max().unwrap_or(0);
+        // Ton: Der Mischer läuft bewusst etwas hinter der Echtzeit (60 ms + 2 Frames im Encoder).
+        // Kurz warten, bis er das Ende des Videos erreicht hat, damit der Clip bis zum Schluss Ton
+        // hat (höchstens 250 ms). Dann eine Kopie der (kleinen) Tonpuffer.
+        let audio = match &self.audio {
+            Some(audio) => {
+                let deadline = Instant::now() + Duration::from_millis(250);
+                while audio.end_time().is_some_and(|end| end < video_end) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                audio.snapshot().map_err(|e| Error::Save(e.to_string()))?
+            }
+            None => Vec::new(),
+        };
+        let ranges: Vec<std::ops::Range<usize>> = audio.iter().map(|a| clip_range(&a.infos, video_start, video_end)).collect();
+        let config = self.audio.as_ref().map(|a| aac_lc_config(a.plan.sample_rate, a.plan.channels)).unwrap_or_default();
+        let tracks: Vec<AudioTrack> = match &self.audio {
+            Some(a) => a
+                .plan
+                .tracks
+                .iter()
+                .zip(audio.iter().zip(&ranges))
+                .map(|(kind, (packets, range))| AudioTrack {
+                    name: kind.label(),
+                    sample_rate: a.plan.sample_rate,
+                    channels: a.plan.channels,
+                    bitrate: a.plan.bitrate,
+                    config: &config,
+                    priming: crate::aac::PRIMING,
+                    infos: &packets.infos[range.clone()],
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let (path, file) = create_unique_file(&request.folder, "Clip", &desktop.timestamp(), "mp4")?;
         let written = (|| -> std::io::Result<veloframe_core::mp4::Mp4Info> {
             let mut out = BufWriter::with_capacity(1 << 20, file);
-            let info = write_mp4(&mut out, snapshot.codec, self.plan.width, self.plan.height, &snapshot.sets, &snapshot.infos, |i, buf| snapshot.packet(i, buf))?;
+            let video = VideoTrack { codec: snapshot.codec, width: self.plan.width, height: self.plan.height, sets: &snapshot.sets, infos };
+            let info = write_mp4(&mut out, &video, &tracks, |p, buf| match p {
+                Packet::Video(i) => snapshot.packets.packet(i, buf),
+                Packet::Audio { track, index } => audio[track].packet(ranges[track].start + index, buf),
+            })?;
             out.flush()?;
             Ok(info)
         })();
-        let still_valid = snapshot.still_valid(self.shared.lock().unwrap().buffer.as_ref().map_or(0, |b| b.written()));
+        let still_valid = snapshot.packets.still_valid(self.shared.lock().unwrap().buffer.as_ref().map_or(0, |b| b.written()));
         let info = match (written, still_valid) {
             (Ok(info), true) => info,
             (Ok(_), false) => {
@@ -439,6 +532,8 @@ impl Recorder {
             width: self.plan.width,
             height: self.plan.height,
             save_ms: start.elapsed().as_secs_f64() * 1000.0,
+            audio_tracks: self.audio.as_ref().map(|a| a.plan.tracks[..info.audio_tracks].to_vec()).unwrap_or_default(),
+            audio_seconds: info.audio_seconds,
         })
     }
 
@@ -447,6 +542,7 @@ impl Recorder {
     }
 
     fn shutdown(&mut self) {
+        self.audio = None;
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

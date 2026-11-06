@@ -13,8 +13,9 @@ VeloFrame has **no user interface**. The host application (e.g. ClipHub) decides
 **Status (Windows):**
 - **Screenshots:** Desktop Duplication, custom PNG and JPEG encoders running on all CPU cores, pre-warmed capture ([plan](docs/PLAN-SCREENSHOT-WIN.md)).
 - **Clip buffer:** continuously keeps the last seconds as video and saves them as MP4 on request. Two modes: **Performance** (5–60 s, tuned for minimal resource usage) and **Long** (up to 300 s). Details in [docs/CLIP-ENGINE.md](docs/CLIP-ENGINE.md).
+- **Audio in clips:** game or system audio and an optional microphone, AAC in the MP4, on the same clock as the video. By default everything you hear *except the host application* (ClipHub's own sounds never end up in a clip). Only one game (without Discord or Spotify), separate tracks for editors, mute/gain while running, Bluetooth headset protection. Measured A/V offset in saved clips: mean +0.7 ms ([plan and results](docs/PLAN-AUDIO-WIN.md)).
 
-Not yet: audio in clips, mouse cursor in video, Windows Graphics Capture (phase 2), macOS and Linux.
+Not yet: mouse cursor in video, Windows Graphics Capture (phase 2), macOS and Linux.
 
 ## Embedding
 
@@ -54,10 +55,30 @@ Start `veloframe.exe` and send one JSON message per line on stdin; answers arriv
 | `warm-up` | | Open capture on all screens up front (`veloframe.exe` does this on start) |
 | `screenshot` | `format` (`png`/`jpeg`), `quality`, `cursor`, `area` (`screen`/`window`), `screen`, `folder`, `clipboard` | Path, size, bytes, source, per-step timings (`captureMs`, `encodeMs`, `writeMs`, `totalMs`, `clipboardMs`) |
 | `copy` | `path` | Copy the last screenshot to the clipboard again, otherwise error `not-cached` |
-| `buffer-start` | `mode` (`performance`/`long`), `seconds`, `fps`, `quality` (`low`…`ultra`), `resolution` (`native`, `1440p`, `1080p`, `720p`), `screen`, optional `codec` (`h264`/`hevc`), `storage` (`file`/`ram`) | Plan, encoder, accepted settings |
-| `buffer-status` | | Seconds and bytes in the buffer, encoded and dropped frames (by reason), encoder effort |
-| `save-clip` | `folder`, optional `seconds` | Path, size, duration, frames, codec, save time |
+| `buffer-start` | `mode` (`performance`/`long`), `seconds`, `fps`, `quality` (`low`…`ultra`), `resolution` (`native`, `1440p`, `1080p`, `720p`), `screen`, optional `codec` (`h264`/`hevc`), `storage` (`file`/`ram`), `audio` (see below) | Plan (including the audio plan), encoder, accepted settings |
+| `buffer-status` | | Seconds and bytes in the buffer, encoded and dropped frames (by reason), encoder effort; `audio`: per source capture path, device, level, dropouts, late/silence ms, drift, device changes, warnings |
+| `save-clip` | `folder`, optional `seconds` | Path, size, duration, frames, codec, save time, `audioTracks`, `audioSeconds` |
 | `buffer-stop` | | Stop the buffer, release memory and encoder |
+| `audio-devices` | | Audio inputs and outputs: `id`, `name`, `kind` (`output`/`input`), `default`, `bluetooth` |
+| `audio-set` | `system` and/or `microphone`: `{"gain": 0…4, "muted": true/false}` | Applied immediately (push-to-talk, mute); returns the audio status |
+
+### Audio
+
+Optional field `audio` in `buffer-start`. Without it: everything except the host application, no microphone, one track.
+
+```json
+"audio": {
+  "system": "all-except-host",   // "all" | "all-except-host" | {"process": 1234} | "off"
+  "microphone": "off",           // "off" | "default" | device id from audio-devices
+  "tracks": "mixed",             // "mixed" | "separate" | "both"
+  "bitrate": 128000              // per track: 96000, 128000, 160000, 192000 (default: Performance 128000, Long 160000)
+}
+```
+
+- `{"process": 1234}` records only that program and its child processes (Windows 10 2004 and newer); `all-except-host` excludes the program that started `veloframe.exe` (or the embedding process, or `hostProcess`). If process audio is not available, VeloFrame records the whole system audio and says so in `buffer-status` (warning `process-loopback-unavailable`).
+- `both`: track 1 is everything mixed (browsers only play the first track), tracks 2 and 3 hold system and microphone separately for video editors.
+- A Bluetooth headset's microphone is never opened via `"default"`: it would switch the headset to the hands-free profile and ruin the game audio (warning `bluetooth-hands-free`). Choose it by its id to use it anyway.
+- If audio cannot start (for example Windows N without the Media Feature Pack), the video buffer still runs and `buffer-status.audio.error` says why.
 
 Errors look like `{"id":1,"ok":false,"error":"Message for the user","code":"no-screen"}`. Applications should react to `code`; the message can be shown directly. Codes: `invalid-request`, `no-screen`, `capture-lost`, `capture-failed`, `save-failed`, `clipboard-failed`, `not-cached`, `unsupported`.
 
@@ -67,13 +88,13 @@ The protocol is compatible with the previous ClipHub capture helper: ClipHub can
 
 | Folder | Crate | Contents |
 | --- | --- | --- |
-| `core` | `veloframe-core` | Platform independent: image types, interfaces (`ScreenSource`, `Desktop`), screenshot pipeline, custom PNG/JPEG encoders (`codec`), clip modes (`clip`), replay buffer (`replay`), MP4 writer (`mp4`), protocol, errors |
+| `core` | `veloframe-core` | Platform independent: image types, interfaces (`ScreenSource`, `Desktop`), screenshot pipeline, custom PNG/JPEG encoders (`codec`), clip modes (`clip`), audio timeline, drift correction and mixer (`audio`), replay and audio buffers (`replay`), MP4 writer with audio tracks (`mp4`), protocol, errors |
 | `engine` | `veloframe` | The engine API (`Engine`) and the `veloframe.exe` program |
-| `Win` | `veloframe-win` | Desktop Duplication, mouse cursor, clipboard, system check, clip buffer (GPU capture, NV12 conversion, hardware encoder via Media Foundation) |
+| `Win` | `veloframe-win` | Desktop Duplication, mouse cursor, clipboard, system check, clip buffer (GPU capture, NV12 conversion, hardware encoder via Media Foundation), audio (WASAPI system/process loopback and microphone, AAC via Media Foundation) |
 | `Mac` | `veloframe-mac` | ScreenCaptureKit, VideoToolbox (empty for now) |
 | `Linux` | `veloframe-linux` | PipeWire, xdg-desktop-portal, X11, VAAPI (empty for now) |
 | `bench` | `veloframe-bench` | Benchmark tool: compare encoders, measure screenshots, memory and the clip buffer |
-| `docs` | | [Architecture](docs/ARCHITECTURE.md), [Windows screenshot plan](docs/PLAN-SCREENSHOT-WIN.md), [Clip engine](docs/CLIP-ENGINE.md) |
+| `docs` | | [Architecture](docs/ARCHITECTURE.md), [Windows screenshot plan](docs/PLAN-SCREENSHOT-WIN.md), [Clip engine](docs/CLIP-ENGINE.md), [Audio plan](docs/PLAN-AUDIO-WIN.md) |
 | `logo` | | Logo |
 
 Empty files describe in their first line what will go there.
@@ -88,6 +109,10 @@ cargo run --release -p veloframe-bench -- capture 20                 # measure r
 cargo run --release -p veloframe-bench -- memory                     # memory after each step
 cargo run --release -p veloframe-bench -- clip performance 30        # measure the clip buffer, save and verify a clip
 cargo run --release -p veloframe-bench -- clip long 60
+cargo run --release -p veloframe-bench -- clip performance 30 35 auto off   # without audio (audio: host | all | mic | off | <pid>)
+cargo run --release -p veloframe-bench -- audio                      # list audio devices
+cargo run --release -p veloframe-bench -- sync 10                    # A/V sync test: white flash + click, offset measured in the saved clip
+cargo run --release -p veloframe-bench -- check "Clip.mp4"           # decode a clip with the Windows decoder (video and audio)
 ```
 
 ## Measurements
@@ -104,6 +129,20 @@ Release build, Intel Core i5-6400 (4 cores), RTX 3050, Windows 10, two monitors 
 | GPU 3D engine | 2–4 % | |
 | Dropped frames under load | 0.4–1.6 % | 2.4 % |
 | Saving | 75–138 ms (31 s clip) | 465 ms (60 s, 65 MB) |
+
+### Audio in the clip buffer
+
+Same PC, other programs using about 30 % of the CPU, 1920×1080 @ 60 fps, system audio in one AAC track at 128 kbit/s.
+
+| | Without audio | With audio | Target |
+| --- | --- | --- | --- |
+| CPU (total) | 0.49 % | 0.82–0.90 % (**+0.33–0.41 %**) | under +0.5 % |
+| RAM (Task Manager) | 19.5 MB | 19.6 MB (audio buffers 1.3 MB) | under +5 MB |
+| Dropouts, late audio | | 0, 0 ms | 0 |
+| A/V offset in the saved clip (`veloframe-bench sync`, 8 runs, 6–7 flash/click pairs each) | | mean **+0.7 ms**, run means −2.9 … +5.6 ms | under 5 ms |
+| Saving (5–16 s clip) | 12–31 ms | 117–133 ms (waits until the audio covers the last frame) | |
+
+Verified: clips with audio in the Windows decoder (Media Foundation) and in Chromium (HEVC and H.264). Details and findings in [docs/PLAN-AUDIO-WIN.md](docs/PLAN-AUDIO-WIN.md).
 
 ### Encoders, 1920×1080 game scene (`veloframe-bench encode`)
 

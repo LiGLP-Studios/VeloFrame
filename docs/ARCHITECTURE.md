@@ -38,6 +38,8 @@ Both split the image into horizontal strips (one per CPU core) and join the part
 
 See [CLIP-ENGINE.md](CLIP-ENGINE.md). In short: `Win/record.rs` (capture thread) → `Win/video.rs` (Desktop Duplication + GPU video processor BGRA→NV12) → queue → `Win/encode.rs` (hardware encoder via Media Foundation) → `core/replay.rs` (fixed ring, RAM or temporary file) → `core/mp4.rs` (MP4 without re-encoding). Modes and encoder plan (`core/clip.rs`), buffer and MP4 are platform independent.
 
+Audio runs next to it on the same clock: `Win/wasapi.rs` (sources) → `Win/audio.rs` (one thread: timeline, mixing) using `core/audio.rs` (silence fill, drift correction, mixer) → `Win/aac.rs` (AAC via Media Foundation) → `core/replay.rs` (`AudioBuffer`, RAM) → `core/mp4.rs` (audio tracks, interleaving, edit list).
+
 ## Errors
 
 `core/error.rs`: Every error has a fixed code (`no-screen`, `capture-lost`, …) for applications and a message that applications can show their users directly. The engine handles `capture-lost` (resolution change, UAC, fullscreen switch) itself: reopen once and try again.

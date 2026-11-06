@@ -3,6 +3,7 @@
 //! Programme binden VeloFrame über das Crate `veloframe` ein; dieses Crate ist das Fundament,
 //! auf dem die Plattform-Crates (`Win`, `Mac`, `Linux`) aufbauen.
 
+pub mod audio;
 pub mod capture;
 pub mod clip;
 pub mod codec;

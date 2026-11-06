@@ -1,5 +1,6 @@
 //! Wählt beim Bauen das passende Plattform-Modul (Win, Mac, Linux).
 
+use veloframe_core::audio::{AudioDevice, AudioSetRequest, AudioStatus};
 use veloframe_core::{BufferRequest, BufferStatus, ClipResult, Result, SaveClipRequest, ScreenshotRequest, ScreenshotResult};
 
 #[cfg(windows)]
@@ -11,15 +12,34 @@ mod imp {
     pub struct Platform {
         screenshots: ScreenshotPipeline<DesktopDuplication, WinDesktop>,
         recorder: Option<Recorder>,
+        /// Prozess, dessen Ton bei `all-except-host` fehlt (ohne Angabe: dieser Prozess).
+        host_process: Option<u32>,
     }
 
     impl Platform {
         pub fn new() -> Result<Self> {
             veloframe_win::init_process();
-            Ok(Self { screenshots: ScreenshotPipeline::new(DesktopDuplication::new(), WinDesktop), recorder: None })
+            Ok(Self { screenshots: ScreenshotPipeline::new(DesktopDuplication::new(), WinDesktop), recorder: None, host_process: None })
+        }
+
+        pub fn set_host_process(&mut self, pid: Option<u32>) {
+            self.host_process = pid;
+        }
+
+        pub fn audio_devices(&self) -> Result<Vec<AudioDevice>> {
+            veloframe_win::wasapi::devices()
+        }
+
+        pub fn set_audio(&self, request: &AudioSetRequest) -> Result<AudioStatus> {
+            self.recorder.as_ref().ok_or_else(|| Error::InvalidRequest("Der Clip-Puffer läuft nicht.".into()))?.set_audio(request)
         }
 
         pub fn start_buffer(&mut self, request: &BufferRequest) -> Result<BufferStatus> {
+            let mut request = request.clone();
+            if request.audio.host_process.is_none() {
+                request.audio.host_process = self.host_process;
+            }
+            let request = &request;
             // Ein laufender Puffer wird erst beendet: immer nur eine Aufnahme gleichzeitig.
             if let Some(old) = self.recorder.take() {
                 old.stop();
@@ -101,6 +121,15 @@ mod imp {
             Err(unsupported())
         }
         pub fn warm_up(&mut self) -> Result<usize> {
+            match *self {}
+        }
+        pub fn set_host_process(&mut self, _: Option<u32>) {
+            match *self {}
+        }
+        pub fn audio_devices(&self) -> Result<Vec<AudioDevice>> {
+            match *self {}
+        }
+        pub fn set_audio(&self, _: &AudioSetRequest) -> Result<AudioStatus> {
             match *self {}
         }
         pub fn start_buffer(&mut self, _: &BufferRequest) -> Result<BufferStatus> {

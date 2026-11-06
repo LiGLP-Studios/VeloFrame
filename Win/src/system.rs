@@ -19,6 +19,8 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW};
+use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+use windows::Win32::Foundation::CloseHandle;
 
 const MF_VERSION: u32 = 0x0002_0070;
 const PROCESS_LOOPBACK_BUILD: u32 = 19041; // Windows 10 2004: audio of a single program
@@ -252,6 +254,26 @@ fn recommend(adapters: &[Adapter], encoders: &[Encoder]) -> Recommendation {
         return Recommendation { encoder: Some(e.name.clone()), hardware: false, reason: "Kein Hardware-Encoder gefunden. Aufnahmen laufen über den Prozessor, daher mit niedrigeren Standardwerten.".into() };
     }
     Recommendation { encoder: None, hardware: false, reason: "Kein H.264-Encoder verfügbar. Unter Windows N fehlt das Media Feature Pack.".into() }
+}
+
+/// Der Prozess, der diesen gestartet hat (bei `veloframe.exe` das einbettende Programm).
+pub fn parent_process_id() -> Option<u32> {
+    let me = std::process::id();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = None;
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            if entry.th32ProcessID == me {
+                found = Some(entry.th32ParentProcessID);
+                break;
+            }
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        found
+    }
 }
 
 pub fn check() -> Result<SystemReport> {

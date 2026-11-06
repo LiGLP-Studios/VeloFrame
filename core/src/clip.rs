@@ -8,6 +8,7 @@
 //! - **Long** (bis 300 s): auf lange Clips und Kompatibilität ausgelegt. H.264, gleichmäßigere
 //!   Bitrate, Keyframes jede Sekunde, sonst derselbe Weg.
 
+use crate::audio::{AudioPlan, AudioRequest, AudioStatus, TrackKind};
 use crate::frame::Rect;
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +96,10 @@ pub struct BufferRequest {
     pub storage: Option<Storage>,
     /// Der aufzunehmende Bildschirm in physischen Pixeln (Desktop-Koordinaten).
     pub screen: Rect,
+    /// Ton. Ohne Angabe: alles außer dem einbettenden Programm, kein Mikrofon, eine Spur.
+    /// `{"system": "off"}` nimmt ohne Ton auf.
+    #[serde(default)]
+    pub audio: AudioRequest,
 }
 
 fn default_seconds() -> u32 {
@@ -128,6 +133,8 @@ pub struct EncoderPlan {
     pub seconds: u32,
     /// GPU-Arbeit der Engine hinter dem Spiel einreihen.
     pub low_gpu_priority: bool,
+    /// Ton; `None` ohne Ton.
+    pub audio: Option<AudioPlan>,
 }
 
 impl EncoderPlan {
@@ -213,6 +220,7 @@ pub fn plan(request: &BufferRequest, hevc_available: bool) -> crate::Result<Enco
         storage: request.storage.unwrap_or(storage),
         seconds: request.seconds,
         low_gpu_priority,
+        audio: crate::audio::plan(&request.audio, request.mode)?,
     })
 }
 
@@ -248,6 +256,8 @@ pub struct BufferStatus {
     /// Wie oft der Regler den Aufwand angepasst hat.
     pub effort_changes: u32,
     pub error: Option<String>,
+    /// Ton-Aufnahme: Quellen, Pegel, Aussetzer, Drift, Warnungen.
+    pub audio: Option<AudioStatus>,
 }
 
 /// Anfrage, einen Clip zu speichern.
@@ -273,6 +283,10 @@ pub struct ClipResult {
     pub height: u32,
     /// Zeit vom Befehl bis zur fertigen Datei.
     pub save_ms: f64,
+    /// Tonspuren in der Datei (leer ohne Ton).
+    pub audio_tracks: Vec<TrackKind>,
+    /// Länge des Tons in Sekunden.
+    pub audio_seconds: f64,
 }
 
 #[cfg(test)]
@@ -289,6 +303,7 @@ mod tests {
             codec: None,
             storage: None,
             screen: Rect::new(0, 0, 1920, 1080),
+            audio: AudioRequest::default(),
         }
     }
 
@@ -338,5 +353,9 @@ mod tests {
         assert_eq!((r.mode, r.seconds, r.resolution, r.codec), (ClipMode::Long, 120, Resolution::P1080, Some(VideoCodec::Hevc)));
         let minimal: BufferRequest = serde_json::from_str(r#"{"screen":{"x":0,"y":0,"width":1920,"height":1080}}"#).unwrap();
         assert_eq!((minimal.mode, minimal.seconds, minimal.fps), (ClipMode::Performance, 30, 60));
+        let audio = plan(&minimal, true).unwrap().audio.unwrap();
+        assert_eq!((audio.system, audio.tracks.len(), audio.bitrate), (crate::audio::SystemAudio::AllExceptHost, 1, 128_000));
+        let silent: BufferRequest = serde_json::from_str(r#"{"audio":{"system":"off"},"screen":{"x":0,"y":0,"width":1920,"height":1080}}"#).unwrap();
+        assert_eq!(plan(&silent, true).unwrap().audio, None);
     }
 }

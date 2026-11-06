@@ -8,18 +8,26 @@
 //! - `video`: Bildquelle und NV12-Umrechnung für Videos auf der GPU
 //! - `encode`: Hardware-Video-Encoder über Media Foundation (NVENC, AMF, QuickSync)
 //! - `record`: Clip-Puffer (Aufnahme-Thread, Replay-Puffer, MP4 speichern)
+//! - `wasapi`: Tonquellen (System-, Prozess-Loopback, Mikrofon), Geräteliste, Gerätewechsel
+//! - `aac`: AAC-Encoder (und Decoder für Tests) über Media Foundation
+//! - `audio`: Ton-Thread des Clip-Puffers (Zeitachse, Mischen, Kodieren)
+//! - `synctest`: Blitz und Klick für den Sync-Test im Messwerkzeug
 
 #![cfg(windows)]
 
+pub mod aac;
+pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod desktop;
 pub mod duplication;
 pub mod encode;
 pub mod record;
+pub mod synctest;
 pub mod system;
 pub mod verify;
 mod video;
+pub mod wasapi;
 
 pub use desktop::WinDesktop;
 pub use duplication::DesktopDuplication;

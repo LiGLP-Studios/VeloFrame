@@ -24,6 +24,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Der Ton des Programms, das die Engine gestartet hat (z. B. ClipHub), gehört nie in einen Clip.
+    #[cfg(windows)]
+    engine.set_host_process(veloframe_win::system::parent_process_id());
     send(&ipc::ready(veloframe::VERSION));
     // Gleich nach dem Start die Aufnahme öffnen: Der erste Screenshot ist dann so schnell wie jeder
     // weitere. Anfragen, die währenddessen kommen, warten im Puffer von stdin. Klappt es nicht,

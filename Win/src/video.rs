@@ -102,6 +102,10 @@ pub(crate) struct ScreenGrabber {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     pub latest: Option<ID3D11Texture2D>,
+    /// QPC-Zählerstand, zu dem Windows das neueste Bild angezeigt hat (0 = noch keins).
+    pub last_present: i64,
+    /// Ob beim letzten `grab` ein neues Bild kam.
+    pub fresh: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -130,6 +134,8 @@ impl ScreenGrabber {
             device: gpu.device.clone(),
             context: gpu.context.clone(),
             latest: None,
+            last_present: 0,
+            fresh: false,
             width: rect.width as u32,
             height: rect.height as u32,
         })
@@ -139,8 +145,13 @@ impl ScreenGrabber {
     pub fn grab(&mut self) -> Result<()> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
+        self.fresh = false;
         match unsafe { self.duplication.AcquireNextFrame(0, &mut info, &mut resource) } {
             Ok(()) => {
+                if info.LastPresentTime != 0 {
+                    self.last_present = info.LastPresentTime;
+                    self.fresh = true;
+                }
                 let copied = if info.LastPresentTime != 0 || self.latest.is_none() { self.store(resource) } else { Ok(()) };
                 let _ = unsafe { self.duplication.ReleaseFrame() };
                 copied

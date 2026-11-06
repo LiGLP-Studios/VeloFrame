@@ -5,6 +5,8 @@
 //! - Zwei Ablageorte: im Arbeitsspeicher (`RamStore`) oder in einer temporären Datei (`FileStore`),
 //!   die Windows möglichst nur im Cache hält und beim Beenden selbst löscht.
 //! - Vorne liegt immer ein Keyframe: Jeder Clip beginnt sauber, ohne neu zu kodieren.
+//! - Ton: `AudioBuffer` nutzt denselben Ring (`PacketRing`) im Arbeitsspeicher; jedes AAC-Frame ist
+//!   ein Einstiegspunkt.
 //! - Speichern hält die Sperre nur für einen Schnappschuss des Inhaltsverzeichnisses; gelesen wird
 //!   danach, damit die Aufnahme nicht stockt.
 
@@ -187,10 +189,74 @@ struct Entry {
     info: PacketInfo,
 }
 
-/// Ein Schnappschuss für einen Clip: was gespeichert wird und wie man es liest.
-pub struct Snapshot {
-    pub codec: VideoCodec,
-    pub sets: ParameterSets,
+/// Ring aus Paketen: die gemeinsame Grundlage für den Video- und den Tonpuffer. Kennt nur Positionen
+/// und Zeiten; wann vorne etwas weg darf, entscheiden die Puffer darüber.
+struct PacketRing {
+    store: Box<dyn Store>,
+    entries: VecDeque<Entry>,
+    /// Laufende Nummer von `entries[0]`.
+    first: u64,
+    written: u64,
+}
+
+impl PacketRing {
+    fn new(store: Box<dyn Store>) -> Self {
+        Self { store, entries: VecDeque::new(), first: 0, written: 0 }
+    }
+
+    /// Ob ein Paket der Länge `len` noch passt, ohne vorne etwas zu überschreiben.
+    fn fits(&self, len: u64) -> bool {
+        self.entries.front().is_none_or(|front| self.written + len - front.position <= self.store.capacity())
+    }
+
+    fn append(&mut self, data: &[u8], info: PacketInfo) -> io::Result<()> {
+        self.store.write(self.written, data)?;
+        self.entries.push_back(Entry { position: self.written, len: data.len() as u32, info });
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    fn drop_front(&mut self, count: usize) {
+        let count = count.min(self.entries.len());
+        self.entries.drain(..count);
+        self.first += count as u64;
+    }
+
+    fn entry(&self, seq: u64) -> &Entry {
+        &self.entries[(seq - self.first) as usize]
+    }
+
+    fn end_time(&self) -> Option<i64> {
+        self.entries.back().map(|e| e.info.dts + e.info.duration)
+    }
+
+    fn buffered_seconds(&self) -> f64 {
+        match (self.entries.front(), self.entries.back()) {
+            (Some(a), Some(b)) => (b.info.dts + b.info.duration - a.info.dts) as f64 / TICKS_PER_SECOND as f64,
+            _ => 0.0,
+        }
+    }
+
+    fn buffered_bytes(&self) -> u64 {
+        self.entries.front().map_or(0, |front| self.written - front.position)
+    }
+
+    fn ram_bytes(&self) -> u64 {
+        self.store.ram_bytes() + (self.entries.capacity() * std::mem::size_of::<Entry>()) as u64
+    }
+
+    /// Schnappschuss ab Eintrag `from` bis zum Ende.
+    fn snapshot(&self, from: usize) -> io::Result<Packets> {
+        let chosen = self.entries.range(from..);
+        let infos: Vec<PacketInfo> = chosen.clone().map(|e| e.info).collect();
+        let positions: Vec<(u64, u32)> = chosen.map(|e| (e.position, e.len)).collect();
+        let start = positions.first().map_or(self.written, |p| p.0);
+        Ok(Packets { infos, positions, reader: self.store.reader(start, self.written)?, overwrite_at: start + self.store.capacity() })
+    }
+}
+
+/// Pakete aus einem Puffer, lesbar ohne dessen Sperre.
+pub struct Packets {
     pub infos: Vec<PacketInfo>,
     positions: Vec<(u64, u32)>,
     reader: RangeReader,
@@ -198,7 +264,7 @@ pub struct Snapshot {
     overwrite_at: u64,
 }
 
-impl Snapshot {
+impl Packets {
     /// Legt Paket `i` in `out`.
     pub fn packet(&self, i: usize, out: &mut Vec<u8>) -> io::Result<()> {
         let (position, len) = self.positions[i];
@@ -206,74 +272,63 @@ impl Snapshot {
         self.reader.read(position, out)
     }
 
-    /// Erste Position, die der Ring überschreibt, wenn bis `written` geschrieben wurde. Liegt der
-    /// Clip-Anfang davor, wurde er während des Speicherns überschrieben.
+    /// Ob die Daten noch gültig sind, wenn der Ring inzwischen bis `written` geschrieben hat. Liegt der
+    /// Anfang davor, wurde er während des Speicherns überschrieben.
     pub fn still_valid(&self, written: u64) -> bool {
         written <= self.overwrite_at
     }
 }
 
+/// Ein Schnappschuss für einen Clip: was gespeichert wird und wie man es liest.
+pub struct Snapshot {
+    pub codec: VideoCodec,
+    pub sets: ParameterSets,
+    pub packets: Packets,
+}
+
 pub struct ReplayBuffer {
     codec: VideoCodec,
-    store: Box<dyn Store>,
-    entries: VecDeque<Entry>,
-    /// Indizes der Keyframes in `entries` (relativ zu `first`).
+    ring: PacketRing,
+    /// Laufende Nummern der Keyframes im Ring.
     keys: VecDeque<u64>,
-    /// Laufende Nummer von `entries[0]`.
-    first: u64,
-    written: u64,
     window: i64,
     sets: ParameterSets,
 }
 
 impl ReplayBuffer {
     pub fn new(codec: VideoCodec, seconds: u32, store: Box<dyn Store>) -> Self {
-        Self {
-            codec,
-            store,
-            entries: VecDeque::new(),
-            keys: VecDeque::new(),
-            first: 0,
-            written: 0,
-            window: seconds as i64 * TICKS_PER_SECOND,
-            sets: ParameterSets::default(),
-        }
+        Self { codec, ring: PacketRing::new(store), keys: VecDeque::new(), window: seconds as i64 * TICKS_PER_SECOND, sets: ParameterSets::default() }
     }
 
     /// Fügt ein Paket hinzu und wirft Altes weg, das nicht mehr gebraucht wird.
     pub fn push(&mut self, data: &[u8], info: PacketInfo) -> io::Result<()> {
-        if self.entries.is_empty() && !info.key {
+        if self.ring.entries.is_empty() && !info.key {
             return Ok(()); // ohne Keyframe vorne ist nichts abspielbar
         }
         let len = data.len() as u64;
-        if len > self.store.capacity() {
+        if len > self.ring.store.capacity() {
             return Err(io::Error::other("Ein einzelnes Bild ist größer als der ganze Puffer."));
         }
         // Platz schaffen: ganze GOPs vorne entfernen, bis das Paket passt.
-        while let Some(front) = self.entries.front() {
-            if self.written + len - front.position <= self.store.capacity() {
-                break;
-            }
+        while !self.ring.entries.is_empty() && !self.ring.fits(len) {
             self.drop_first_gop();
         }
-        self.store.write(self.written, data)?;
         if info.key {
             let sets = ParameterSets::from_packet(self.codec, data);
             if sets.is_complete(self.codec) {
                 self.sets = sets;
             }
-            if self.entries.is_empty() {
+            if self.ring.entries.is_empty() {
                 self.keys.clear();
             }
-            self.keys.push_back(self.first + self.entries.len() as u64);
+            self.keys.push_back(self.ring.first + self.ring.entries.len() as u64);
         }
-        self.entries.push_back(Entry { position: self.written, len: len as u32, info });
-        self.written += len;
+        self.ring.append(data, info)?;
 
         // Zeitfenster: vorne darf ein GOP weg, sobald der nächste Keyframe allein das Fenster abdeckt.
         let end = info.dts + info.duration;
         while self.keys.len() >= 2 {
-            let second = self.entry(self.keys[1]).info.dts;
+            let second = self.ring.entry(self.keys[1]).info.dts;
             if end - second < self.window {
                 break;
             }
@@ -289,59 +344,90 @@ impl ReplayBuffer {
         }
     }
 
-    fn entry(&self, seq: u64) -> &Entry {
-        &self.entries[(seq - self.first) as usize]
-    }
-
     fn drop_first_gop(&mut self) {
-        let until = if self.keys.len() >= 2 { self.keys[1] } else { self.first + self.entries.len() as u64 };
-        let count = (until - self.first) as usize;
-        self.entries.drain(..count);
-        self.first = until;
+        let until = if self.keys.len() >= 2 { self.keys[1] } else { self.ring.first + self.ring.entries.len() as u64 };
+        self.ring.drop_front((until - self.ring.first) as usize);
         self.keys.pop_front();
     }
 
     pub fn buffered_seconds(&self) -> f64 {
-        match (self.entries.front(), self.entries.back()) {
-            (Some(a), Some(b)) => (b.info.dts + b.info.duration - a.info.dts) as f64 / TICKS_PER_SECOND as f64,
-            _ => 0.0,
-        }
+        self.ring.buffered_seconds()
     }
 
     pub fn buffered_bytes(&self) -> u64 {
-        self.entries.front().map_or(0, |front| self.written - front.position)
+        self.ring.buffered_bytes()
     }
 
     pub fn ram_bytes(&self) -> u64 {
-        self.store.ram_bytes() + (self.entries.capacity() * std::mem::size_of::<Entry>()) as u64
+        self.ring.ram_bytes()
     }
 
     pub fn written(&self) -> u64 {
-        self.written
+        self.ring.written
     }
 
     /// Schnappschuss der letzten `seconds` Sekunden (oder des ganzen Puffers), beginnend am letzten
     /// Keyframe, der davor liegt. Der Clip ist also nie kürzer als gewünscht.
     pub fn snapshot(&self, seconds: Option<u32>) -> io::Result<Snapshot> {
-        let Some(last) = self.entries.back() else {
+        let Some(end) = self.ring.end_time() else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Der Puffer ist noch leer."));
         };
-        let end = last.info.dts + last.info.duration;
         let start_time = seconds.map_or(i64::MIN, |s| end - s as i64 * TICKS_PER_SECOND);
-        let start_seq = self.keys.iter().rev().copied().find(|&k| self.entry(k).info.dts <= start_time).unwrap_or(self.first);
-        let first = (start_seq - self.first) as usize;
-        let chosen = self.entries.range(first..);
-        let infos: Vec<PacketInfo> = chosen.clone().map(|e| e.info).collect();
-        let positions: Vec<(u64, u32)> = chosen.map(|e| (e.position, e.len)).collect();
-        let start = positions[0].0;
-        Ok(Snapshot {
-            codec: self.codec,
-            sets: self.sets.clone(),
-            infos,
-            positions,
-            reader: self.store.reader(start, self.written)?,
-            overwrite_at: start + self.store.capacity(),
-        })
+        let start_seq = self.keys.iter().rev().copied().find(|&k| self.ring.entry(k).info.dts <= start_time).unwrap_or(self.ring.first);
+        Ok(Snapshot { codec: self.codec, sets: self.sets.clone(), packets: self.ring.snapshot((start_seq - self.ring.first) as usize)? })
+    }
+}
+
+/// Tonpuffer einer Spur: fertige AAC-Frames im Arbeitsspeicher (128 kbit/s × 60 s ≈ 1 MB). Jedes
+/// Frame ist ein Einstiegspunkt, vorne fällt einfach weg, was älter als das Fenster ist.
+pub struct AudioBuffer {
+    ring: PacketRing,
+    window: i64,
+}
+
+impl AudioBuffer {
+    /// `seconds`: wie weit der Ton zurückreichen muss; `bitrate` (bit/s) bestimmt die Größe des Rings.
+    pub fn new(seconds: u32, bitrate: u32) -> Self {
+        // AAC-Frames schwanken um den Mittelwert: 50 % Reserve und 2 s obendrauf.
+        let capacity = bitrate as u64 / 8 * (seconds as u64 + 2) * 3 / 2;
+        Self { ring: PacketRing::new(Box::new(RamStore::new(capacity))), window: seconds as i64 * TICKS_PER_SECOND }
+    }
+
+    pub fn push(&mut self, data: &[u8], info: PacketInfo) -> io::Result<()> {
+        let len = data.len() as u64;
+        if len > self.ring.store.capacity() {
+            return Err(io::Error::other("Ein Tonpaket ist größer als der ganze Puffer."));
+        }
+        while !self.ring.entries.is_empty() && !self.ring.fits(len) {
+            self.ring.drop_front(1);
+        }
+        self.ring.append(data, info)?;
+        let end = info.pts + info.duration;
+        let old = self.ring.entries.iter().take_while(|e| end - (e.info.pts + e.info.duration) > self.window).count();
+        self.ring.drop_front(old);
+        Ok(())
+    }
+
+    pub fn buffered_seconds(&self) -> f64 {
+        self.ring.buffered_seconds()
+    }
+
+    pub fn ram_bytes(&self) -> u64 {
+        self.ring.ram_bytes()
+    }
+
+    pub fn written(&self) -> u64 {
+        self.ring.written
+    }
+
+    /// Bis wohin (100 ns) der Ton reicht.
+    pub fn end_time(&self) -> Option<i64> {
+        self.ring.end_time()
+    }
+
+    /// Alle Pakete im Puffer (eine Kopie, wenige Millisekunden).
+    pub fn snapshot(&self) -> io::Result<Packets> {
+        self.ring.snapshot(0)
     }
 }
 
@@ -371,6 +457,7 @@ mod tests {
     }
 
     fn frame_numbers(s: &Snapshot) -> Vec<u32> {
+        let s = &s.packets;
         let mut buf = Vec::new();
         (0..s.infos.len())
             .map(|i| {
@@ -393,7 +480,7 @@ mod tests {
             let seconds = buffer.buffered_seconds();
             assert!((3.0..4.0).contains(&seconds), "{seconds} s im Puffer");
             let snap = buffer.snapshot(None).unwrap();
-            assert!(snap.infos[0].key);
+            assert!(snap.packets.infos[0].key);
             assert_eq!(frame_numbers(&snap), (70..100).collect::<Vec<u32>>());
             assert!(snap.sets.is_complete(VideoCodec::H264));
         }
@@ -439,7 +526,40 @@ mod tests {
         let mut buffer = ReplayBuffer::new(VideoCodec::H264, 60, Box::new(RamStore::new(1_500)));
         fill(&mut buffer, 20, 10);
         let snap = buffer.snapshot(None).unwrap();
-        assert!(snap.still_valid(buffer.written()));
-        assert!(!snap.still_valid(buffer.written() + 2_000));
+        assert!(snap.packets.still_valid(buffer.written()));
+        assert!(!snap.packets.still_valid(buffer.written() + 2_000));
+    }
+
+    #[test]
+    fn audio_buffer_keeps_the_window_and_every_frame() {
+        let d = TICKS_PER_SECOND * 1024 / 48_000;
+        let mut audio = AudioBuffer::new(2, 128_000);
+        for i in 0..500i64 {
+            let data = vec![(i % 251) as u8; 300 + (i % 7) as usize];
+            audio.push(&data, PacketInfo { pts: i * d, dts: i * d, duration: d, key: true }).unwrap();
+        }
+        let seconds = audio.buffered_seconds();
+        assert!((2.0..2.1).contains(&seconds), "{seconds} s Ton im Puffer");
+        let snap = audio.snapshot().unwrap();
+        let first = snap.infos[0].pts / d;
+        assert_eq!(snap.infos.len() as i64, 500 - first);
+        let mut buf = Vec::new();
+        snap.packet(snap.infos.len() - 1, &mut buf).unwrap();
+        assert_eq!((buf.len(), buf[0]), (300 + 499 % 7, (499 % 251) as u8));
+        assert!(audio.ram_bytes() < 200_000);
+    }
+
+    #[test]
+    fn audio_buffer_drops_old_frames_when_full() {
+        let d = TICKS_PER_SECOND * 1024 / 48_000;
+        let mut audio = AudioBuffer::new(60, 96_000);
+        let capacity = 96_000 / 8 * 62 * 3 / 2;
+        // Viel größere Pakete als die Bitrate erwartet: Der Ring läuft voll und wirft vorne weg.
+        for i in 0..2_000i64 {
+            audio.push(&vec![1; 2_000], PacketInfo { pts: i * d, dts: i * d, duration: d, key: true }).unwrap();
+        }
+        let snap = audio.snapshot().unwrap();
+        assert!(snap.infos.len() as u64 * 2_000 <= capacity);
+        assert_eq!(snap.infos.last().unwrap().pts, 1_999 * d);
     }
 }

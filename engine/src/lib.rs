@@ -29,6 +29,7 @@ pub mod commands;
 mod platform;
 pub mod upload;
 
+pub use veloframe_core::audio::{self, AudioDevice, AudioRequest, AudioSetRequest, AudioStatus, Microphone, SourceControl, SystemAudio, TrackKind, TrackLayout};
 pub use veloframe_core::clip::{Quality, Resolution, Storage};
 pub use veloframe_core::{
     Area, BufferRequest, BufferStatus, ClipMode, ClipResult, Error, ImageFormat, Rect, Result, SaveClipRequest, ScreenshotRequest,
@@ -90,6 +91,22 @@ impl Engine {
     /// Speichert den Puffer (oder die letzten `seconds`) als MP4. Die Aufnahme läuft dabei weiter.
     pub fn save_clip(&self, request: &SaveClipRequest) -> Result<ClipResult> {
         self.platform.save_clip(request)
+    }
+
+    /// Ton- Ein- und Ausgabegeräte mit ID, Name, Standard und Bluetooth.
+    pub fn audio_devices(&self) -> Result<Vec<AudioDevice>> {
+        self.platform.audio_devices()
+    }
+
+    /// Lautstärke oder Stummschaltung je Tonquelle, während der Puffer läuft (z. B. Push-to-Talk).
+    pub fn set_audio(&self, request: &AudioSetRequest) -> Result<AudioStatus> {
+        self.platform.set_audio(request)
+    }
+
+    /// Prozess, dessen Ton bei `all-except-host` nie im Clip landet. Ohne Angabe: dieser Prozess.
+    /// `veloframe.exe` setzt hier das Programm, das es gestartet hat (z. B. ClipHub).
+    pub fn set_host_process(&mut self, pid: Option<u32>) {
+        self.platform.set_host_process(pid)
     }
 
     /// Beendet den Clip-Puffer und gibt Speicher, GPU und Encoder frei.

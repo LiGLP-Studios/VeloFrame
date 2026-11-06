@@ -313,6 +313,7 @@ dependencies = [
  "serde",
  "veloframe-core",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
