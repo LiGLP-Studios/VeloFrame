@@ -36,7 +36,7 @@ Both split the image into horizontal strips (one per CPU core) and join the part
 
 ## Clip engine
 
-See [CLIP-ENGINE.md](CLIP-ENGINE.md). In short: `Win/record.rs` (capture thread) → `Win/video.rs` (Desktop Duplication + GPU video processor BGRA→NV12) → queue → `Win/encode.rs` (hardware encoder via Media Foundation) → `core/replay.rs` (fixed ring, RAM or temporary file) → `core/mp4.rs` (MP4 without re-encoding). Modes and encoder plan (`core/clip.rs`), buffer and MP4 are platform independent.
+See [CLIP-ENGINE.md](CLIP-ENGINE.md). In short: `Win/record.rs` (capture thread) → `Win/video.rs` (Desktop Duplication + GPU video processor BGRA→NV12) → queue → `Win/encode.rs` (hardware encoder via Media Foundation) → `core/replay.rs` (fixed ring, RAM or temporary file) → `core/mp4.rs` (MP4 without re-encoding). The mouse cursor is a second input of the video processor (`core/cursor.rs` converts the shape). On save, `Win/smartstart.rs` re-encodes only the beginning up to the next keyframe so the clip starts at the requested frame. Modes and encoder plan (`core/clip.rs`), buffer and MP4 are platform independent.
 
 Audio runs next to it on the same clock: `Win/wasapi.rs` (sources) → `Win/audio.rs` (one thread: timeline, mixing) using `core/audio.rs` (silence fill, drift correction, mixer) → `Win/aac.rs` (AAC via Media Foundation) → `core/replay.rs` (`AudioBuffer`, RAM) → `core/mp4.rs` (audio tracks, interleaving, edit list).
 

@@ -23,13 +23,15 @@ With audio, the clip gets one to three AAC tracks next to the video (see [Audio]
 ```
 Desktop Duplication ─► GPU texture (only when something changed)
         │
-GPU video processor: BGRA → NV12, BT.709, scaling ─► frame from the encoder pool
+GPU video processor: BGRA → NV12, BT.709, scaling, rotation, ─► frame from the encoder pool
+                     mouse cursor as a second input with alpha
         │
 Queue (up to 4 frames) ─► hardware encoder (NVENC / AMF / QuickSync via Media Foundation)
         │
 Packets ─► replay buffer (fixed ring, always a keyframe at the front)
         │
-save-clip ─► MP4 (index at the front, packets unchanged)
+save-clip ─► MP4 (index at the front, packets unchanged; only the beginning up to the next
+              keyframe is re-encoded so the clip starts at the requested frame)
 ```
 
 The CPU never touches a pixel. The clock thread is registered with Windows as a capture task (MMCSS) and is woken on time even under load.
@@ -41,6 +43,11 @@ The CPU never touches a pixel. The clock thread is registered with Windows as a 
 - **Buffer in a temporary file:** Windows keeps it in the cache where possible and only writes it to the SSD when memory runs low; it is deleted on exit (even after a crash). This memory does not count towards the engine, and Windows can give it back to the game at any time.
 - **Saving without a copy:** The index is copied under the lock, the data is read afterwards while recording continues. The clip is never held completely in memory. If the ring was overwritten meanwhile, this is detected.
 - **One capture for both:** Windows allows only one Desktop Duplication session per screen and program. While the buffer runs, screenshots of that screen come from the live image (measured 17 ms total).
+- **Mouse cursor:** Desktop Duplication delivers the pointer position with every frame and the shape only when it changes. The shape is converted once per change into a small BGRA texture with alpha (`core/cursor.rs`; inverting pixels become black with a white outline) and drawn by the video processor as a second input stream in the same pass as the NV12 conversion. Switching it (`cursor-set`) only enables or disables that stream; encoder and buffer keep running. A hidden cursor (most games) is not drawn. Screenshots from the running buffer draw the cursor according to their own `cursor` setting.
+- **Rotated screens:** the video processor rotates the image upright during the conversion; screenshots from the running buffer read the region in rotated coordinates. If the resolution or rotation changes while recording, the conversion is set up again and the video keeps its size.
+- **Frame-accurate start (`Win/smartstart.rs`):** the buffer can only start at a keyframe. On save, the frames from the requested start up to the next keyframe are decoded (Media Foundation decoder, D3D11) and re-encoded by a second hardware encoder with the same settings; everything after that keyframe is copied unchanged. Frames stay on the GPU. GPU device and encoder are kept after the first clip. If the new beginning has different parameter sets, the MP4 gets a second sample description. If Windows has no decoder for the codec (HEVC on Windows 10 without the Store extension), the edit list sets the start instead: no Media Foundation player can play that clip anyway, all others honor the edit list.
+- **MP4 for every player:** Media Foundation applies `media_time` in edit lists with the wrong sign (measured for audio and video), so the video edit list never uses it; composition offsets are shifted so the first shown frame is at 0 (`ctts` version 1). Media Foundation also plays the last audio `trak` it finds and ignores the "enabled" flag, Chromium follows the flag: audio tracks are written in reverse order so both play track 1.
+- **Lost capture:** when Desktop Duplication loses access (UAC, a game switching to fullscreen, resolution change), the old capture is released first, the screen is looked up again (fresh DXGI enumeration, same screen and GPU) and reopened. With the screen object from the start, every new capture was lost again at once and the video stood still. Failed attempts are retried every 250 ms; if no image arrives for 2 s, `error` says so. Independently, the capture is reopened when no new image came for 2 s (1–2 ms; on a quiet screen it just delivers the same image again). `screenUpdates` and `captureRestarts` in `buffer-status` show whether the video is live.
 - **Clean teardown:** The encoder is drained (`DRAIN`) before it is shut down; Media Foundation stays started for the lifetime of the process. Before, stopping crashed in about one in five runs; afterwards 40 out of 40 runs ended cleanly.
 
 ## Audio
@@ -83,9 +90,10 @@ Verified: H.264 clips with the Windows decoder (all frames, correct duration, mi
 
 ## Known limitations
 
-- **No mouse cursor** in the video yet.
-- Audio: device changes and the microphone path are implemented but not yet measured on hardware (see [PLAN-AUDIO-WIN.md](PLAN-AUDIO-WIN.md)). The A/V offset per recording varies by a few ms with the phase between the capture clock and the display refresh.
-- One screen per buffer; rotated screens not yet supported.
-- A clip starts at the last keyframe before the requested start (Performance: up to 2 s earlier). "Smart start" (re-encode only the beginning, accurate to the frame) is still to do.
+- Audio: device changes are implemented but not yet measured on hardware; the microphone is measured (see [STATUS-WIN-1.0.md](STATUS-WIN-1.0.md)). The A/V offset per recording varies by a few ms with the phase between the capture clock and the display refresh.
+- One screen per buffer. Rotated screens are supported but not yet tested on a rotated monitor.
+- The frame-accurate start costs save time: 150–530 ms with NVENC and a 1 s GOP (Long), more with a 2 s GOP or a weaker GPU (measured up to 1.2 s on an Intel HD 530), and 6.6 s while a game kept the same GPU busy.
+- While a game uses the same GPU, frames are dropped: 8–20 % measured with Minecraft fullscreen on an RTX 3050 with a 4-core CPU.
+- A buffer started while the display is off records nothing until the display comes back.
 - Windows 10 only plays HEVC with the "HEVC Video Extensions" from the Microsoft Store; browsers (Chrome, Edge, Electron) play HEVC with hardware support. For maximum compatibility use `codec: "h264"`.
-- The NVIDIA HEVC encoder does not accept B-frames (they are then missing from `applied`).
+- The NVIDIA encoder does not accept B-frames, neither for HEVC nor H.264 (they are then missing from `applied`).

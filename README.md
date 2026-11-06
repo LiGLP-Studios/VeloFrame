@@ -15,7 +15,10 @@ VeloFrame has **no user interface**. The host application (e.g. ClipHub) decides
 - **Clip buffer:** continuously keeps the last seconds as video and saves them as MP4 on request. Two modes: **Performance** (5–60 s, tuned for minimal resource usage) and **Long** (up to 300 s). Details in [docs/CLIP-ENGINE.md](docs/CLIP-ENGINE.md).
 - **Audio in clips:** game or system audio and an optional microphone, AAC in the MP4, on the same clock as the video. By default everything you hear *except the host application* (ClipHub's own sounds never end up in a clip). Only one game (without Discord or Spotify), separate tracks for editors, mute/gain while running, Bluetooth headset protection. Measured A/V offset in saved clips: mean +0.7 ms ([plan and results](docs/PLAN-AUDIO-WIN.md)).
 
-Not yet: mouse cursor in video, Windows Graphics Capture (phase 2), macOS and Linux.
+- **Mouse cursor in video:** drawn by the GPU video processor in the same pass as the color conversion, switchable by the host at any time (`cursor`, `cursor-set`).
+- **Frame-accurate clip start:** a clip starts exactly at the requested time; only the beginning up to the next keyframe is re-encoded.
+
+Status of the 1.0 plan: [docs/STATUS-WIN-1.0.md](docs/STATUS-WIN-1.0.md). Not yet: Windows Graphics Capture (phase 2), macOS and Linux.
 
 ## Embedding
 
@@ -55,12 +58,13 @@ Start `veloframe.exe` and send one JSON message per line on stdin; answers arriv
 | `warm-up` | | Open capture on all screens up front (`veloframe.exe` does this on start) |
 | `screenshot` | `format` (`png`/`jpeg`), `quality`, `cursor`, `area` (`screen`/`window`), `screen`, `folder`, `clipboard` | Path, size, bytes, source, per-step timings (`captureMs`, `encodeMs`, `writeMs`, `totalMs`, `clipboardMs`) |
 | `copy` | `path` | Copy the last screenshot to the clipboard again, otherwise error `not-cached` |
-| `buffer-start` | `mode` (`performance`/`long`), `seconds`, `fps`, `quality` (`low`…`ultra`), `resolution` (`native`, `1440p`, `1080p`, `720p`), `screen`, optional `codec` (`h264`/`hevc`), `storage` (`file`/`ram`), `audio` (see below) | Plan (including the audio plan), encoder, accepted settings |
-| `buffer-status` | | Seconds and bytes in the buffer, encoded and dropped frames (by reason), encoder effort; `audio`: per source capture path, device, level, dropouts, late/silence ms, drift, device changes, warnings |
-| `save-clip` | `folder`, optional `seconds` | Path, size, duration, frames, codec, save time, `audioTracks`, `audioSeconds` |
+| `buffer-start` | `mode` (`performance`/`long`), `seconds`, `fps`, `quality` (`low`…`ultra`), `resolution` (`native`, `1440p`, `1080p`, `720p`), `screen`, optional `codec` (`h264`/`hevc`), `storage` (`file`/`ram`), `audio` (see below), `cursor` (`true`/`false`, default `true`) | Plan (including the audio plan), encoder, accepted settings |
+| `buffer-status` | | Seconds and bytes in the buffer, encoded and dropped frames (by reason), encoder effort, `screenUpdates` (new screen images so far; stays flat on a quiet screen), `captureRestarts` (capture reopened after lost access: UAC, fullscreen, resolution change), `error` (last capture error, disappears 5 s after it last occurred), `cursor` (current state), `cursorError` (why the cursor cannot be drawn, if so); `audio`: per source capture path, device, level, dropouts, late/silence ms, drift, device changes, warnings |
+| `save-clip` | `folder`, optional `seconds` (default: the buffer length) | Path, size, duration, frames, codec, save time, `audioTracks`, `audioSeconds`, `start` (`reencoded`/`edit-list`/`keyframe`), `startOffsetMs` (actual start minus requested start, normally 0), `startEncodeMs` |
 | `buffer-stop` | | Stop the buffer, release memory and encoder |
 | `audio-devices` | | Audio inputs and outputs: `id`, `name`, `kind` (`output`/`input`), `default`, `bluetooth` |
 | `audio-set` | `system` and/or `microphone`: `{"gain": 0…4, "muted": true/false}` | Applied immediately (push-to-talk, mute); returns the audio status |
+| `cursor-set` | `visible` (`true`/`false`) | Mouse cursor in the video on or off from the next frame (e.g. bound to a hotkey); returns the buffer status |
 
 ### Audio
 
@@ -76,7 +80,7 @@ Optional field `audio` in `buffer-start`. Without it: everything except the host
 ```
 
 - `{"process": 1234}` records only that program and its child processes (Windows 10 2004 and newer); `all-except-host` excludes the program that started `veloframe.exe` (or the embedding process, or `hostProcess`). If process audio is not available, VeloFrame records the whole system audio and says so in `buffer-status` (warning `process-loopback-unavailable`).
-- `both`: track 1 is everything mixed (browsers only play the first track), tracks 2 and 3 hold system and microphone separately for video editors.
+- `both`: track 1 is everything mixed (players only play the first track: Chromium and the Windows player both pick it), tracks 2 and 3 hold system and microphone separately for video editors.
 - A Bluetooth headset's microphone is never opened via `"default"`: it would switch the headset to the hands-free profile and ruin the game audio (warning `bluetooth-hands-free`). Choose it by its id to use it anyway.
 - If audio cannot start (for example Windows N without the Media Feature Pack), the video buffer still runs and `buffer-status.audio.error` says why.
 
@@ -112,8 +116,17 @@ cargo run --release -p veloframe-bench -- clip long 60
 cargo run --release -p veloframe-bench -- clip performance 30 35 auto off   # without audio (audio: host | all | mic | off | <pid>)
 cargo run --release -p veloframe-bench -- audio                      # list audio devices
 cargo run --release -p veloframe-bench -- sync 10                    # A/V sync test: white flash + click, offset measured in the saved clip
-cargo run --release -p veloframe-bench -- check "Clip.mp4"           # decode a clip with the Windows decoder (video and audio)
+cargo run --release -p veloframe-bench -- check "Clip.mp4"           # decode a clip with the Windows decoder (video, all audio tracks)
+cargo run --release -p veloframe-bench -- cursor 720p                # mouse cursor: hotspot, switching, CPU (moves the mouse for ~40 s)
+cargo run --release -p veloframe-bench -- cursorload 10               # dropped frames with/without cursor in the same buffer
+cargo run --release -p veloframe-bench -- start long h264            # frame-accurate clip start: length, method, save time
+cargo run --release -p veloframe-bench -- mic default both           # microphone: tracks, mute, level per track
+cargo run --release -p veloframe-bench -- robust 50                  # start/stop 50 times with audio, then without AAC encoder
+cargo run --release -p veloframe-bench -- devices 60                 # audio device changes live (unplug the headset meanwhile)
+cargo run --release -p veloframe-bench -- longrun performance 60     # long run every minute: RAM, CPU, frames and drop reasons, screen updates, capture restarts, drift, handles (CSV)
 ```
+
+`VELOFRAME_BENCH_SCREEN=x,y,width,height` measures another screen (for example one on a second GPU).
 
 ## Measurements
 
@@ -143,6 +156,24 @@ Same PC, other programs using about 30 % of the CPU, 1920×1080 @ 60 fps, system
 | Saving (5–16 s clip) | 12–31 ms | 117–133 ms (waits until the audio covers the last frame) | |
 
 Verified: clips with audio in the Windows decoder (Media Foundation) and in Chromium (HEVC and H.264). Details and findings in [docs/PLAN-AUDIO-WIN.md](docs/PLAN-AUDIO-WIN.md).
+
+### Windows 1.0 additions
+
+Same PC, 1920×1080 @ 60 fps. Details in [docs/STATUS-WIN-1.0.md](docs/STATUS-WIN-1.0.md).
+
+| | Measured | Target |
+| --- | --- | --- |
+| A/V offset after the 1.0 changes (`sync`, Long H.264) | run means −1.7 … +5.4 ms | under 5 ms |
+| B-frame clips (Intel QuickSync, Performance H.264) | first frame at 0 in the Windows decoder and Chromium, same offset as without B-frames | in sync in both players |
+| Mouse cursor: hotspot | crosshair ±0.5 px, arrow tip 1 px; at 720p from 1080p within 2 screen px | correct shape and hotspot |
+| Mouse cursor: `cursor-set` | takes effect in the same frame, both directions | within one frame |
+| Mouse cursor: extra CPU | +0.004 ms per frame ≈ 0.007 % of total CPU | under 0.05 % |
+| Clip start (Long H.264, NVENC) | exactly as long as requested (12 of 12 clips), first frame at 0 | within one frame |
+| Saving with frame-accurate start | 150–530 ms (Long, NVENC); 400–1210 ms (Performance, 2 s GOP, Intel iGPU) | measured |
+| Start/stop 50 times with audio | no crash, handles and RAM flat | no crash, no leak |
+| One hour per mode | RAM, handles and audio drift flat; no late audio, no dropouts | no leak, no drift |
+| Game start (fullscreen) while recording | video keeps running (2 capture restarts); before the fix it froze | video keeps running |
+| Dropped frames while playing (Minecraft fullscreen, same GPU) | 8–20 % (Long: about 60 % encoder busy, 40 % thread late) | to be improved |
 
 ### Encoders, 1920×1080 game scene (`veloframe-bench encode`)
 

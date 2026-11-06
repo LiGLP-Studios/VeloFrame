@@ -10,6 +10,8 @@
 //! veloframe-bench cursor [auflösung]     Mauszeiger im Video: Hotspot, Umschalten, CPU (bewegt die Maus kurz)
 //! veloframe-bench mic [default|<id>] [both|separate]   Mikrofon: Spuren, Stummschalten, Pegel im Clip
 //! veloframe-bench start [performance|long] [h264|hevc]   bildgenauer Clip-Anfang: Länge, Art, Speicherzeit
+//! veloframe-bench longrun [performance|long] [minuten]   Langzeitlauf: jede Minute RAM, CPU, Bilder, Drift, Handles (CSV)
+//! veloframe-bench cursorload [runden]   verworfene Bilder mit/ohne Zeiger im selben Puffer (alle 15 s umgeschaltet)
 //! veloframe-bench robust [anzahl]        Start/Stopp mit Ton (Handles, Speicher), dann ohne AAC-Encoder
 //! veloframe-bench devices [sekunden]     Gerätewechsel live (Headset ab-/anstecken, Standardgerät umstellen)
 //! ```
@@ -1068,8 +1070,12 @@ fn start_test(mode: veloframe::ClipMode, codec: veloframe::VideoCodec) -> Result
         let clip = engine.save_clip(&SaveClipRequest { folder: folder.clone(), seconds }).map_err(|e| e.to_string())?;
         let wanted = seconds.unwrap_or(plan.seconds) as f64;
         let check = if codec == veloframe::VideoCodec::H264 {
+            // Naht: Helligkeit jedes Bildes; ein kaputtes Bild am Übergang wäre ein Sprung.
+            let jump = veloframe_win::verify::video_brightness(std::path::Path::new(&clip.path), (0.0, 0.0, 1.0, 1.0))
+                .map(|b| b.windows(2).enumerate().map(|(i, w)| ((w[1].1 - w[0].1).abs(), i + 1)).fold((0.0f32, 0), |a, x| if x.0 > a.0 { x } else { a }))
+                .unwrap_or((f32::NAN, 0));
             veloframe_win::verify::check_video(std::path::Path::new(&clip.path), clip.frames)
-                .map(|c| format!("Windows-Decoder {} Bilder, {:.3} s, erstes Bild bei {:.1} ms", c.frames, c.duration_seconds, c.first_time as f64 / 1e4))
+                .map(|c| format!("Windows-Decoder {} Bilder, {:.3} s, erstes Bild bei {:.1} ms, größter Helligkeitssprung {:.2} bei Bild {}", c.frames, c.duration_seconds, c.first_time as f64 / 1e4, jump.0, jump.1))
                 .unwrap_or_else(|e| format!("Windows-Decoder: {e}"))
         } else {
             "HEVC: Windows-Decoder fehlt".into()
@@ -1088,6 +1094,129 @@ fn start_test(mode: veloframe::ClipMode, codec: veloframe::VideoCodec) -> Result
         std::thread::sleep(std::time::Duration::from_millis(700));
     }
     engine.stop_buffer();
+    Ok(())
+}
+
+/// Langzeitlauf: `minutes` Minuten Aufnahme mit Ton, jede Minute eine Zeile (RAM, CPU, Bilder,
+/// Aufwand, Ton-Drift, Aussetzer, Handles), auch als CSV neben die Clips. Am Ende ein Clip zur Prüfung.
+#[cfg(windows)]
+fn longrun(mode: veloframe::ClipMode, minutes: u32) -> Result<(), String> {
+    use std::io::Write as _;
+    use veloframe::{AudioRequest, BufferRequest, Quality, Resolution, SaveClipRequest};
+    let mb = |b: usize| b as f64 / 1_048_576.0;
+    let folder = std::env::temp_dir().join("veloframe-clips");
+    let _ = std::fs::create_dir_all(&folder);
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let seconds = if mode == veloframe::ClipMode::Long { 120 } else { 30 };
+    let request = BufferRequest {
+        mode,
+        seconds,
+        fps: 60,
+        quality: Quality::High,
+        resolution: Resolution::Native,
+        codec: None,
+        storage: None,
+        screen,
+        audio: AudioRequest::default(),
+        cursor: true,
+    };
+    let status = engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    let plan = status.plan.ok_or("kein Plan")?;
+    let csv_path = folder.join(format!("longrun-{:?}-{}.csv", mode, std::process::id()).to_lowercase());
+    let mut csv = std::fs::File::create(&csv_path).map_err(|e| e.to_string())?;
+    let _ = writeln!(csv, "minute,ram_mb,cpu_percent,frames_encoded,frames_dropped,effort,audio_drift_ms,audio_late_ms,audio_dropouts,handles,screen_updates,capture_restarts");
+    println!("Langzeitlauf {:?} {:?} {} min, Puffer {} s, CSV: {}", plan.mode, plan.codec, minutes, seconds, csv_path.display());
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    let (mut cpu0, mut t0) = (process_cpu_seconds(), Instant::now());
+    let (mut enc0, mut drop0, mut upd0) = (0u64, 0u64, 0u64);
+    let (mut busy0, mut pool0, mut late0) = (0u64, 0u64, 0u64);
+    for minute in 1..=minutes {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let st = engine.buffer_status();
+        let cpu = (process_cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64() * 100.0 / cores;
+        (cpu0, t0) = (process_cpu_seconds(), Instant::now());
+        let audio = st.audio.as_ref();
+        let drift = audio.map_or(0.0, |a| a.sources.iter().map(|s| s.drift_ms.abs()).fold(0.0, f64::max));
+        let late = audio.map_or(0.0, |a| a.sources.iter().map(|s| s.late_ms).sum());
+        let dropouts: u64 = audio.map_or(0, |a| a.sources.iter().map(|s| s.dropouts).sum());
+        let ram = mb(private_working_set());
+        println!(
+            "  {minute:>3} min: RAM {ram:.1} MB, CPU {cpu:.2} %, Bilder +{} / verworfen +{} (Encoder belegt {}, Pool voll {}, zu spät {}), neue Bildschirmbilder +{}, Neustarts {}, Aufwand {}, Drift {drift:.2} ms, zu spät {late:.0} ms, Aussetzer {dropouts}, Handles {}{}",
+            st.frames_encoded - enc0,
+            st.frames_dropped - drop0,
+            st.dropped_encoder_busy - busy0,
+            st.dropped_pool_full - pool0,
+            st.dropped_late - late0,
+            st.screen_updates - upd0,
+            st.capture_restarts,
+            st.encoder_effort,
+            handle_count(),
+            st.error.as_ref().map(|e| format!(", Fehler: {e}")).unwrap_or_default()
+        );
+        let _ = writeln!(csv, "{minute},{ram:.2},{cpu:.3},{},{},{},{drift:.3},{late:.1},{dropouts},{},{},{}", st.frames_encoded, st.frames_dropped, st.encoder_effort, handle_count(), st.screen_updates, st.capture_restarts);
+        (enc0, drop0, upd0) = (st.frames_encoded, st.frames_dropped, st.screen_updates);
+        (busy0, pool0, late0) = (st.dropped_encoder_busy, st.dropped_pool_full, st.dropped_late);
+    }
+    let clip = engine.save_clip(&SaveClipRequest { folder, seconds: None }).map_err(|e| e.to_string())?;
+    engine.stop_buffer();
+    println!("Clip am Ende: {} ({:.1} s, {} Bilder, Ton {:.1} s, Anfang {:?}, gespeichert in {:.0} ms)", clip.path, clip.duration_seconds, clip.frames, clip.audio_seconds, clip.start, clip.save_ms);
+    Ok(())
+}
+
+/// Verworfene Bilder mit und ohne Mauszeiger im selben Puffer: Der Zeiger wird alle 15 s umgeschaltet,
+/// so trifft fremde Last (andere Programme auf der GPU) beide Hälften gleich. Die Maus steht dabei in
+/// der Mitte des Hauptbildschirms (danach zurück).
+#[cfg(windows)]
+fn cursor_load(rounds: u32) -> Result<(), String> {
+    use veloframe::{AudioRequest, BufferRequest, ClipMode, Quality, Resolution, SystemAudio};
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let request = BufferRequest {
+        mode: ClipMode::Performance,
+        seconds: 30,
+        fps: 60,
+        quality: Quality::High,
+        resolution: Resolution::Native,
+        codec: None,
+        storage: None,
+        screen,
+        audio: AudioRequest { system: SystemAudio::Off, ..Default::default() },
+        cursor: true,
+    };
+    let status = engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    let plan = status.plan.ok_or("kein Plan")?;
+    println!("{:?} {:?}, Zeiger {} — {} Runden à 2 × 15 s", plan.mode, plan.codec, status.cursor_error.unwrap_or_else(|| "möglich".into()), rounds);
+    let old = move_mouse(screen.x + screen.width / 2, screen.y + screen.height / 2);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let mut totals = [(0u64, 0u64); 2]; // (kodiert, verworfen) je Zeiger aus/an
+    let mut last = engine.buffer_status();
+    for round in 1..=rounds {
+        // `VELOFRAME_BENCH_OFF_FIRST`: Reihenfolge umdrehen (prüft, ob ein Unterschied nur an der
+        // Reihenfolge liegt).
+        // `VELOFRAME_BENCH_HOLD=on|off`: Zeiger die ganze Zeit an bzw. aus (z. B. für GPU-Zähler).
+        let order = match std::env::var("VELOFRAME_BENCH_HOLD").as_deref() {
+            Ok("on") => [true, true],
+            Ok("off") => [false, false],
+            _ if std::env::var_os("VELOFRAME_BENCH_OFF_FIRST").is_some() => [false, true],
+            _ => [true, false],
+        };
+        for visible in order {
+            engine.set_cursor(visible).map_err(|e| e.to_string())?;
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            let now = engine.buffer_status();
+            let (encoded, dropped) = (now.frames_encoded - last.frames_encoded, now.frames_dropped - last.frames_dropped);
+            totals[visible as usize].0 += encoded;
+            totals[visible as usize].1 += dropped;
+            println!("  Runde {round:>2}, Zeiger {}: {encoded} kodiert, {dropped} verworfen, Aufwand {}", if visible { "an " } else { "aus" }, now.encoder_effort);
+            last = now;
+        }
+    }
+    move_mouse(old.0, old.1);
+    engine.stop_buffer();
+    for (visible, (encoded, dropped)) in [(false, totals[0]), (true, totals[1])] {
+        println!("Zeiger {}: {encoded} kodiert, {dropped} verworfen = {:.2} %", if visible { "an " } else { "aus" }, dropped as f64 * 100.0 / (encoded + dropped).max(1) as f64);
+    }
     Ok(())
 }
 
@@ -1175,6 +1304,13 @@ fn main() {
             if args.get(1).map(String::as_str) == Some("long") { veloframe::ClipMode::Long } else { veloframe::ClipMode::Performance },
             if args.get(2).map(String::as_str) == Some("hevc") { veloframe::VideoCodec::Hevc } else { veloframe::VideoCodec::H264 },
         ),
+        #[cfg(windows)]
+        Some("longrun") => longrun(
+            if args.get(1).map(String::as_str) == Some("long") { veloframe::ClipMode::Long } else { veloframe::ClipMode::Performance },
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(60),
+        ),
+        #[cfg(windows)]
+        Some("cursorload") => cursor_load(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(10)),
         #[cfg(windows)]
         Some("robust") => robust(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(50)),
         #[cfg(windows)]
