@@ -11,7 +11,6 @@ The clip buffer continuously captures a screen, encodes in hardware and keeps th
 | Bitrate 1080p60 "high" | mean 6.2 / cap 10.4 Mbit/s, follows the content | mean 13.6 / cap 16 Mbit/s |
 | Keyframe | every 2 s | every second |
 | Encoder effort | 85 (controller lowers it when needed) | 70 (controller lowers it when needed) |
-| GPU priority | behind the game | normal |
 | Buffer | temporary file | temporary file |
 
 Codec and buffer location can be overridden per request (`codec`, `storage`).
@@ -34,7 +33,7 @@ save-clip ─► MP4 (index at the front, packets unchanged; only the beginning 
               keyframe is re-encoded so the clip starts at the requested frame)
 ```
 
-The CPU never touches a pixel. The clock thread is registered with Windows as a capture task (MMCSS) and is woken on time even under load.
+The CPU never touches a pixel. The clock thread is registered with Windows as a capture task (MMCSS) and is woken on time even under load. The hardware encoder works in threads that Media Foundation and the driver create; VeloFrame raises them to `THREAD_PRIORITY_HIGHEST` right after setup, so a game that keeps all cores busy cannot push them aside (together they use well under 1 % CPU). GPU work runs at normal priority in both modes: behind the game (−4) the conversion sometimes waited so long that up to 26 % of the frames were lost, and the game gained nothing measurable from it.
 
 ## What VeloFrame does itself
 
@@ -92,8 +91,8 @@ Verified: H.264 clips with the Windows decoder (all frames, correct duration, mi
 
 - Audio: device changes are implemented but not yet measured on hardware; the microphone is measured (see [STATUS-WIN-1.0.md](STATUS-WIN-1.0.md)). The A/V offset per recording varies by a few ms with the phase between the capture clock and the display refresh.
 - One screen per buffer. Rotated screens are supported but not yet tested on a rotated monitor.
-- The frame-accurate start costs save time: 150–530 ms with NVENC and a 1 s GOP (Long), more with a 2 s GOP or a weaker GPU (measured up to 1.2 s on an Intel HD 530), and 6.6 s while a game kept the same GPU busy.
-- While a game uses the same GPU, frames are dropped: 8–20 % measured with Minecraft fullscreen on an RTX 3050 with a 4-core CPU.
+- The frame-accurate start costs save time: 150–530 ms with NVENC and a 1 s GOP (Long), more with a 2 s GOP or a weaker GPU (measured up to 1.2 s on an Intel HD 530). Under a synthetic game load 0.5–1.4 s; the first clip 2.2 s, because GPU device, encoder and decoder for it are only set up then.
+- Dropped frames while playing: 8–20 % were measured with Minecraft on an RTX 3050 with a 4-core CPU before the encoder threads were raised. Under a synthetic game load it is now 0 % (Long) and 0 % (Performance); not yet checked again with a real game.
 - A buffer started while the display is off records nothing until the display comes back.
 - Windows 10 only plays HEVC with the "HEVC Video Extensions" from the Microsoft Store; browsers (Chrome, Edge, Electron) play HEVC with hardware support. For maximum compatibility use `codec: "h264"`.
 - The NVIDIA encoder does not accept B-frames, neither for HEVC nor H.264 (they are then missing from `applied`).

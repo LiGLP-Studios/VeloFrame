@@ -14,9 +14,13 @@
 //! veloframe-bench cursorload [runden]   verworfene Bilder mit/ohne Zeiger im selben Puffer (alle 15 s umgeschaltet)
 //! veloframe-bench robust [anzahl]        Start/Stopp mit Ton (Handles, Speicher), dann ohne AAC-Encoder
 //! veloframe-bench devices [sekunden]     Gerätewechsel live (Headset ab-/anstecken, Standardgerät umstellen)
+//! veloframe-bench gameload [sekunden] [gpu-ms] [cpu-threads] [frame|free]   nachgebaute Spiel-Last (GPU voll, CPU-Kerne belegt)
 //! ```
 //!
 //! Immer im Release-Build messen: `cargo run --release -p veloframe-bench -- ...`
+
+#[cfg(windows)]
+mod gameload;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -1127,6 +1131,7 @@ fn longrun(mode: veloframe::ClipMode, minutes: u32) -> Result<(), String> {
     let mut csv = std::fs::File::create(&csv_path).map_err(|e| e.to_string())?;
     let _ = writeln!(csv, "minute,ram_mb,cpu_percent,frames_encoded,frames_dropped,effort,audio_drift_ms,audio_late_ms,audio_dropouts,handles,screen_updates,capture_restarts");
     println!("Langzeitlauf {:?} {:?} {} min, Puffer {} s, CSV: {}", plan.mode, plan.codec, minutes, seconds, csv_path.display());
+    println!("Encoder {}: {}", status.encoder.clone().unwrap_or_default(), status.applied.join(", "));
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
     let (mut cpu0, mut t0) = (process_cpu_seconds(), Instant::now());
     let (mut enc0, mut drop0, mut upd0) = (0u64, 0u64, 0u64);
@@ -1311,6 +1316,13 @@ fn main() {
         ),
         #[cfg(windows)]
         Some("cursorload") => cursor_load(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(10)),
+        #[cfg(windows)]
+        Some("gameload") => gameload::run(
+            args.get(1).and_then(|n| n.parse().ok()).unwrap_or(300),
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(8.0),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
+            args.get(4).map(String::as_str) != Some("free"),
+        ),
         #[cfg(windows)]
         Some("robust") => robust(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(50)),
         #[cfg(windows)]

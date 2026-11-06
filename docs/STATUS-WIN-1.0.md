@@ -1,6 +1,6 @@
 # Status: Windows 1.0 (work in progress)
 
-State of the work on [PLAN-WIN-1.0.md](PLAN-WIN-1.0.md) as of 2026-11-06. `cargo build --release` is clean, `cargo test --workspace` passes.
+State of the work on [PLAN-WIN-1.0.md](PLAN-WIN-1.0.md) as of 2026-11-07. `cargo build --release` is clean, `cargo test --workspace` passes.
 
 ## Overview
 
@@ -12,7 +12,7 @@ State of the work on [PLAN-WIN-1.0.md](PLAN-WIN-1.0.md) as of 2026-11-06. `cargo
 | W5 microphone and devices | microphone **done** (and a track-order bug fixed); device changes and Bluetooth **still need manual help** |
 | W6 robustness | start/stop ×50 and "no AAC" **done**; display-mode change at a game start **found broken, fixed and verified** (see W7); resolution change, UAC and sleep **still need manual help** |
 | W4 frame-accurate clip start | **done**, measured (NVENC H.264, QuickSync with B-frames, HEVC edit-list path) |
-| W7 long run | **done**: 1 h per mode, Long partly while playing; found and fixed a video that froze at the game start; dropped frames while playing (8–20 %) measured, **not yet improved** |
+| W7 long run | **done**: 1 h per mode, Long partly while playing; found and fixed a video that froze at the game start; dropped frames while playing (8–20 %) **found and fixed**, measured with a synthetic game load, **not yet checked with a real game** |
 | W8 docs and commit | README, CLIP-ENGINE.md, ARCHITECTURE.md and website updated; commit commands given |
 
 ## W1: video edit list
@@ -152,18 +152,37 @@ The first long run dropped 1–15 % of the frames per minute (earlier: 0.4–1.6
 
 **Verified:** Minecraft was restarted (19:00:12) while a Long buffer was running. There were 2 capture restarts, and the clip shows the loading screen and then the title screen, so the video kept running. With the old code the same event froze it. That run still had a small bug, now fixed: the old capture was released one step too late, so reopening needed one extra attempt after 250 ms. The final code then ran about 10 minutes with the game, without problems.
 
-**Dropped frames while playing** (Minecraft fullscreen on the RTX 3050, live capture, 2–3 min per run):
+**Dropped frames while playing, before the fix** (Minecraft fullscreen on the RTX 3050, live capture, 2–3 min per run):
 
 | | Dropped per minute | Reasons |
 | --- | --- | --- |
 | Long H.264 | 11–18 % | about 60 % "encoder busy", 40 % "thread late" |
 | Performance HEVC | 8–20 % | (not logged in that run) |
 
-- This is the first measurement with a game. The README value (0.4–1.6 %) was measured under CPU load without a game. The 6.5 % in the long run above was on the frozen image, with no new image to copy.
-- "Encoder busy": converted frames wait for the GPU, which works on the game first. "Thread late": the capture thread came more than two frames late (4-core CPU, Minecraft uses a lot of it).
-- Saving with frame-accurate start took 6.6 s under game load; the re-encode waits behind the game too.
-- Not fixed for the pre-alpha. This is the next performance item.
-- Recording the second screen (Intel HD 530) while the game runs drops about two thirds of the frames, with the old and the new code alike.
+**Found and fixed: the encoder's threads lost against the game.**
+- Reproduced without a game with `veloframe-bench gameload` (below): a GPU-bound window in its own process plus 4 busy CPU threads. With 2 busy threads 0.3 % of the frames were dropped, with all 4 cores busy 3–5 %, all "encoder busy", and the effort controller went down to 0.
+- `VELOFRAME_TRACE=1` showed the capture thread on time (woken at most 3 ms late, it is registered with MMCSS). The hardware encoder runs in threads that Media Foundation and the driver create, at normal priority. The game's threads (also normal) got the cores first, frames piled up and were dropped. When such a thread held the D3D device lock, the capture thread waited too (up to 56 ms in one conversion): that is "thread late".
+- Proof: the whole recording process at "above normal" priority, same load: 0 of 3627 frames dropped instead of 117, effort stayed at 70, saving took 464 ms instead of 872 ms.
+- The NVIDIA encoder does not offer MMCSS registration (`IMFRealTimeClient`).
+- Second cause in Performance mode: its conversion ran at low GPU priority on purpose (−4, "game first"). In 2 of 5 runs under GPU load that cost many frames (26 % and 12 %), in the others nothing. The game did not gain anything measurable from it: with recording it ran 2–3 % slower either way (about 47.5 instead of 48.8 frames/s). The conversion costs 0.15–0.27 ms of GPU time per frame.
+
+**Fix (`Win/src/threads.rs`, `Win/src/record.rs`, `Win/src/smartstart.rs`, `Win/src/video.rs`):**
+- Threads created while the buffer is set up (encoder, driver, Media Foundation) run at `THREAD_PRIORITY_HIGHEST`, above the game's normal threads. Together they use well under 1 % CPU. `applied` says how many ("9 Encoder-Threads höher priorisiert" on this PC).
+- The same for encoder and decoder of the frame-accurate start when saving.
+- GPU work runs at normal priority in both modes. `lowGpuPriority` is gone from the plan.
+
+**Measured, same load for both builds** (`gameload 660 20 4`: GPU-bound at about 49 frames/s, every frame presented, all 4 cores busy; 2 min per run, 1920×1080 @ 60 fps, system audio):
+
+| | Last commit | Now |
+| --- | --- | --- |
+| Long H.264 | 7.2 % dropped (522 of 7216, almost all "encoder busy"), effort down to 0 | 0 of 7227 dropped, effort stays at 70 |
+| Performance HEVC | 6.8 % dropped (489 of 7204), effort down to 0 | 0 of 7227 dropped, effort stays at 85 |
+| Saving at the end | Long 120 s clip: 4.7 s, 6678 instead of 7200 frames; Performance 30 s: 0.34 s | Long 120 s clip: 4.0 s, all 7200 frames; Performance 30 s: 0.77 s |
+| "Game" frame rate while recording | 49.5 frames/s (51.6 without recording) | 49.5 frames/s (51.6 without recording) |
+
+- Under this load, saving with frame-accurate start: 0.5–1.4 s per clip, the first clip 2.2 s (1.7 s of it set up GPU device, encoder and decoder, which happens only once). Before: 6.6 s with Minecraft.
+- **Not yet verified with a real game.** The next run with Minecraft shows whether the drops are gone there too.
+- Recording the second screen (Intel HD 530) while the game runs drops about two thirds of the frames, with the old and the new code alike. Not looked at.
 
 ## New measurement tools (`veloframe-bench`)
 
@@ -176,10 +195,13 @@ The first long run dropped 1–15 % of the frames per minute (earlier: 0.4–1.6
 | `devices [s]` | live device changes (manual: unplug the headset, change the default device) |
 | `start [performance\|long] [h264\|hevc]` | frame-accurate start: length, method, save time, seam |
 | `longrun [performance\|long] [minutes]` | long run, one line per minute (drop reasons, new screen images, capture restarts), CSV |
+| `gameload [s] [gpu-ms] [cpu-threads] [frame\|free]` | synthetic game load in its own process: draws 1920×1080 so that each frame costs about `gpu-ms` on the GPU (tuned in the first 6 s, then fixed, so the frame rate shows what recording costs), presents every frame in a 1280×720 window on top (`free`: only when a buffer is free), plus busy CPU threads at normal priority. Prints the frame rate every 10 s |
 | `cursorload [rounds]` | dropped frames with and without cursor in the same buffer (switched every 15 s); `VELOFRAME_BENCH_OFF_FIRST`, `VELOFRAME_BENCH_HOLD=on\|off` |
 | `check <clip>` | now also shows the first frame time and all audio tracks (which one plays by default) |
 
 Hardware tests (ignored by default, `cargo test -p veloframe-win --release -- --ignored <name> --nocapture`): `converter_cost` (GPU time of the conversion), `duplication_probe` (what Desktop Duplication reports for 8 s: new images, timeouts, lost access, reopen results), `reopen_cost` (reopening with fresh enumeration, per screen).
+
+`VELOFRAME_TRACE=1` (engine and bench): every 2 s the longest time per step of the capture thread (wake-up, grab, convert, hand to the encoder, collect packets) and the drop counters; after 20 s the process threads with CPU time and priority; on save the time until GPU device, encoder and decoder are ready. Written to stderr.
 
 `VELOFRAME_BENCH_SCREEN=x,y,w,h` picks another screen, e.g. the Intel GPU for its encoder. `VELOFRAME_BENCH_CURSOR=off` records `clip` without the cursor.
 
@@ -188,10 +210,11 @@ Hardware tests (ignored by default, `cargo test -p veloframe-win --release -- --
 - `core/src/mp4.rs`: composition offsets instead of `media_time`, presentation length, reversed audio `trak` order, second sample description, `skip`
 - `core/src/cursor.rs` (new), `core/src/clip.rs` (`cursor`, `CursorSetRequest`, `cursorError`, `ClipStart`, new result fields, `screenUpdates`, `captureRestarts`), `core/src/lib.rs`
 - `Win/src/video.rs`: pointer, cursor stream, rotation, `adapter_by_luid`, reopening the capture after lost access (fresh enumeration, retry delay, 2 s watchdog)
-- `Win/src/record.rs`: cursor switch, rotation, rebuilding the video processor, smart start in `save`, `error` disappears 5 s after the last occurrence
+- `Win/src/record.rs`: cursor switch, rotation, rebuilding the video processor, smart start in `save`, `error` disappears 5 s after the last occurrence, raising the encoder threads, `VELOFRAME_TRACE` timings
+- `Win/src/threads.rs` (new): threads of the process, raising new ones, CPU time per thread; `Win/src/smartstart.rs`: raising encoder and decoder threads on save; `Win/src/video.rs`, `core/src/clip.rs`: normal GPU priority in both modes (`lowGpuPriority` removed)
 - `Win/src/smartstart.rs` (new), `Win/src/encode.rs` (`finish`, `restart`), `Win/src/aac.rs` (test switch), `Win/src/verify.rs` (crops, all audio tracks, first frame time), `Win/src/synctest.rs` (cursor shape), `Win/src/lib.rs`
 - `engine/src/lib.rs`, `engine/src/platform.rs`, `engine/src/commands.rs`: `set_cursor` / `cursor-set`
-- `bench/src/main.rs`: the new commands above
+- `bench/src/main.rs`, `bench/src/gameload.rs` (new): the new commands above
 - Docs: `README.md`, `docs/CLIP-ENGINE.md`, `docs/ARCHITECTURE.md`; website `../website/docs.html` and `../website/en/docs.html` (not in this repository)
 
 ## Next steps
@@ -200,6 +223,6 @@ Hardware tests (ignored by default, `cargo test -p veloframe-win --release -- --
    - Rotated monitor (W3).
    - Unplugging the headset and changing the default device (W5): `veloframe-bench devices 60`.
    - Resolution change, UAC and sleep while recording (W6). `captureRestarts` and `screenUpdates` in `longrun` now show whether the video keeps running.
-2. Dropped frames while playing (8–20 % on this PC) and save time under game load (6.6 s): look at GPU priority in Long mode, the capture thread's CPU priority and the number of waiting frames. The drop reasons in `buffer-status` and `longrun` show where frames are lost.
-3. A full hour per mode while playing, with the final code (it ran about 10 minutes with the game).
+2. Minecraft (or another game) while `longrun` runs, per mode, with the final code: check that the drops are gone with a real game too, then a full hour per mode.
+3. Optional: set up the encoder for the frame-accurate start right when the buffer starts instead of at the first save. The first clip under game load would then save in about 0.5 s instead of 2.2 s; it costs a second encoder session for as long as the buffer runs.
 4. Then add the remaining numbers to README and CLIP-ENGINE.md and remove the limitations that are verified.

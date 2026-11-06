@@ -119,6 +119,7 @@ cargo run --release -p veloframe-bench -- sync 10                    # A/V sync 
 cargo run --release -p veloframe-bench -- check "Clip.mp4"           # decode a clip with the Windows decoder (video, all audio tracks)
 cargo run --release -p veloframe-bench -- cursor 720p                # mouse cursor: hotspot, switching, CPU (moves the mouse for ~40 s)
 cargo run --release -p veloframe-bench -- cursorload 10               # dropped frames with/without cursor in the same buffer
+cargo run --release -p veloframe-bench -- gameload 300 20 4          # synthetic game load in its own process (start before longrun)
 cargo run --release -p veloframe-bench -- start long h264            # frame-accurate clip start: length, method, save time
 cargo run --release -p veloframe-bench -- mic default both           # microphone: tracks, mute, level per track
 cargo run --release -p veloframe-bench -- robust 50                  # start/stop 50 times with audio, then without AAC encoder
@@ -173,7 +174,9 @@ Same PC, 1920×1080 @ 60 fps. Details in [docs/STATUS-WIN-1.0.md](docs/STATUS-WI
 | Start/stop 50 times with audio | no crash, handles and RAM flat | no crash, no leak |
 | One hour per mode | RAM, handles and audio drift flat; no late audio, no dropouts | no leak, no drift |
 | Game start (fullscreen) while recording | video keeps running (2 capture restarts); before the fix it froze | video keeps running |
-| Dropped frames while playing (Minecraft fullscreen, same GPU) | 8–20 % (Long: about 60 % encoder busy, 40 % thread late) | to be improved |
+| Dropped frames while playing (Minecraft fullscreen, same GPU), before the fix | 8–20 % (Long: about 60 % encoder busy, 40 % thread late) | |
+| Dropped frames under a synthetic game load (`gameload`: GPU-bound, all 4 cores busy) | Long 0 %, Performance 0 %; the last commit 7.2 % and 6.8 % | under 1 %; still to be checked with a real game |
+| Saving with frame-accurate start under that load | 0.5–1.4 s, the first clip 2.2 s (before: 6.6 s with Minecraft) | |
 
 ### Encoders, 1920×1080 game scene (`veloframe-bench encode`)
 
