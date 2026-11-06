@@ -262,6 +262,13 @@ pub struct BufferStatus {
     pub encoder_effort: u32,
     /// Wie oft der Regler den Aufwand angepasst hat.
     pub effort_changes: u32,
+    /// Neue Bildschirmbilder seit dem Start. Steigt nicht, solange sich auf dem Bildschirm nichts
+    /// ändert; steigt er beim Spielen nicht, steht das Bild.
+    pub screen_updates: u64,
+    /// Wie oft die Bildschirmaufnahme nach verlorenem Zugriff neu geöffnet wurde (UAC, Vollbild,
+    /// Auflösungswechsel).
+    pub capture_restarts: u32,
+    /// Letzter Fehler der Aufnahme. Verschwindet 5 s, nachdem er zuletzt auftrat.
     pub error: Option<String>,
     /// Ob der Mauszeiger gerade ins Video gezeichnet wird (eingeschaltet; ein ausgeblendeter Zeiger,
     /// z. B. in Spielen, erscheint trotzdem nicht).

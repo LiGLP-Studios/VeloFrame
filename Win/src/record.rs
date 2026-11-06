@@ -69,6 +69,30 @@ impl FrameTap for RecorderTap {
 struct Shared {
     buffer: Option<ReplayBuffer>,
     status: BufferStatus,
+    /// Wann `status.error` zuletzt gesetzt wurde.
+    error_at: Option<Instant>,
+}
+
+/// So lange bleibt ein Fehler im Status stehen, nachdem er zuletzt auftrat. Kurze Störungen (UAC,
+/// Vollbildwechsel) sieht die Anwendung so noch, ein behobener Fehler verschwindet danach wieder.
+const ERROR_HOLD: Duration = Duration::from_secs(5);
+
+impl Shared {
+    /// Fehler der Aufnahme-Schleife seit der letzten Meldung (oder keiner): neuen setzen, einen alten
+    /// nach `ERROR_HOLD` ohne Wiederholung löschen.
+    fn report_error(&mut self, error: Option<String>, now: Instant) {
+        match error {
+            Some(error) => {
+                self.status.error = Some(error);
+                self.error_at = Some(now);
+            }
+            None if self.error_at.is_some_and(|at| now.duration_since(at) >= ERROR_HOLD) => {
+                self.status.error = None;
+                self.error_at = None;
+            }
+            None => {}
+        }
+    }
 }
 
 pub struct Recorder {
@@ -224,6 +248,7 @@ fn drain(encoder: &mut HardwareEncoder, shared: &Mutex<Shared>) -> Result<()> {
         }
         if let Err(e) = buffer.push(data, info) {
             shared.status.error = Some(format!("Puffer: {e}"));
+            shared.error_at = Some(Instant::now());
         }
     })
 }
@@ -406,9 +431,9 @@ fn run(
             shared.status.dropped_pool_full = pool_full;
             shared.status.dropped_late = late;
             shared.status.cursor_error = p.converter.cursor_error.clone();
-            if error.is_some() {
-                shared.status.error = error.take();
-            }
+            shared.status.screen_updates = p.grabber.updates;
+            shared.status.capture_restarts = p.grabber.restarts;
+            shared.report_error(error.take(), Instant::now());
         }
     }
     // Abbau in fester Reihenfolge: wartende Bilder zurück in den Pool, dann Encoder (fährt seine
@@ -430,7 +455,7 @@ impl Recorder {
         let lag = Arc::new(AtomicI64::new(TICKS_PER_SECOND / (2 * request.fps.max(1) as i64)));
         let stop = Arc::new(AtomicBool::new(false));
         let cursor = Arc::new(AtomicBool::new(request.cursor));
-        let shared = Arc::new(Mutex::new(Shared { buffer: None, status: BufferStatus::default() }));
+        let shared = Arc::new(Mutex::new(Shared { buffer: None, status: BufferStatus::default(), error_at: None }));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(EncoderPlan, Rect, u64)>>();
         let (frames_tx, frames_rx) = mpsc::channel::<FrameRequest>();
         let request = request.clone();
@@ -700,6 +725,23 @@ impl Drop for Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_disappear_some_seconds_after_the_last_one() {
+        let mut shared = Shared { buffer: None, status: BufferStatus::default(), error_at: None };
+        let t = Instant::now();
+        let s = Duration::from_secs;
+        shared.report_error(Some("Zugriff verweigert".into()), t);
+        shared.report_error(None, t + s(4));
+        assert_eq!(shared.status.error.as_deref(), Some("Zugriff verweigert"));
+        // Ein neuer Fehler verlängert die Anzeige.
+        shared.report_error(Some("Bild holen".into()), t + s(4));
+        shared.report_error(None, t + s(8));
+        assert_eq!(shared.status.error.as_deref(), Some("Bild holen"));
+        shared.report_error(None, t + s(9));
+        assert_eq!(shared.status.error, None);
+        assert_eq!(shared.error_at, None);
+    }
 
     #[test]
     fn regions_of_rotated_screens_map_into_the_image() {

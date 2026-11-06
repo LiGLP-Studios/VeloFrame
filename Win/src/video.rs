@@ -9,6 +9,7 @@
 
 use crate::duplication::to_rect;
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 use veloframe_core::cursor::{self, CursorImage, PointerKind};
 use veloframe_core::{Error, Rect, Result, Rotation};
 use windows::Win32::Foundation::{RECT, TRUE};
@@ -124,10 +125,25 @@ pub(crate) struct Pointer {
     pub version: u64,
 }
 
+/// Kommt so lange kein neues Bild, wird die Aufnahme vorsorglich neu geöffnet (kostet 1–2 ms). Falls
+/// Windows nach einem Moduswechsel stumm keine Bilder mehr schickt, steht das Video so höchstens
+/// kurz; auf einem ruhigen Bildschirm liefert das Öffnen einfach dasselbe Bild noch einmal.
+const STALE_REOPEN: Duration = Duration::from_secs(2);
+/// Wartezeit bis zum nächsten Versuch, wenn das Öffnen scheitert oder der Zugriff gleich wieder
+/// verloren geht (statt es bei jedem Bild zu versuchen).
+const RETRY: Duration = Duration::from_millis(250);
+/// Geht der Zugriff so lange immer wieder verloren, ohne dass ein Bild kommt, meldet die Aufnahme
+/// einen Fehler (sonst sähe die Anwendung nur ein stehendes Bild).
+const LOST_ERROR: Duration = Duration::from_secs(2);
+
 /// Holt Bilder eines Bildschirms per Desktop Duplication in eine GPU-Textur.
 pub(crate) struct ScreenGrabber {
-    output: IDXGIOutput1,
-    duplication: IDXGIOutputDuplication,
+    /// Name des Bildschirms (z. B. DISPLAY1) und Grafikkarte: damit wird er nach einem Moduswechsel
+    /// frisch gesucht.
+    name: [u16; 32],
+    luid: u64,
+    /// `None`, solange die Aufnahme verloren ist und neu geöffnet werden muss.
+    duplication: Option<IDXGIOutputDuplication>,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     pub latest: Option<ID3D11Texture2D>,
@@ -142,6 +158,17 @@ pub(crate) struct ScreenGrabber {
     pub rotation: Rotation,
     pub pointer: Pointer,
     shape_buffer: Vec<u8>,
+    /// Neue Bilder insgesamt (zum Erkennen eines stehenden Bildes beim Testen).
+    pub updates: u64,
+    /// Wie oft die Aufnahme nach verlorenem Zugriff neu geöffnet wurde.
+    pub restarts: u32,
+    last_fresh: Instant,
+    opened_at: Instant,
+    /// Verlorene Zugriffe seit dem letzten neuen Bild.
+    losses: u32,
+    retry_at: Option<Instant>,
+    /// Warum die Aufnahme gerade verloren ist.
+    lost_reason: String,
 }
 
 fn rotation_of(duplication: &IDXGIOutputDuplication) -> Rotation {
@@ -163,14 +190,39 @@ fn duplicate(output: &IDXGIOutput1, device: &ID3D11Device) -> Result<IDXGIOutput
     .map_err(d3d("Desktop Duplication"))
 }
 
+/// Sucht den Bildschirm `name` an der Grafikkarte `luid` frisch. Nach einem Moduswechsel (z. B. wenn
+/// ein Spiel in den Vollbildmodus geht) liefert das alte Objekt sonst Aufnahmen, die sofort wieder
+/// verloren gehen: Das Video bliebe stehen.
+fn find_output_by_name(luid: u64, name: &[u16; 32]) -> Result<IDXGIOutput1> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(d3d("DXGI"))?;
+    let mut a = 0;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(a) } {
+        a += 1;
+        if !unsafe { adapter.GetDesc1() }.is_ok_and(|d| crate::encode::luid_u64(d.AdapterLuid) == luid) {
+            continue;
+        }
+        let mut o = 0;
+        while let Ok(output) = unsafe { adapter.EnumOutputs(o) } {
+            o += 1;
+            if unsafe { output.GetDesc() }.is_ok_and(|d| d.DeviceName == *name && d.AttachedToDesktop.as_bool()) {
+                return output.cast().map_err(d3d("Bildschirm"));
+            }
+        }
+    }
+    Err(Error::CaptureLost("Der Bildschirm hängt nicht mehr an der Grafikkarte der Aufnahme.".into()))
+}
+
 impl ScreenGrabber {
     pub fn new(output: IDXGIOutput1, rect: Rect, gpu: &Gpu) -> Result<Self> {
         let duplication = duplicate(&output, &gpu.device)?;
         let rotation = rotation_of(&duplication);
         let (width, height) = rotation.image_size(rect.width as usize, rect.height as usize);
+        let name = unsafe { output.GetDesc() }.map_err(d3d("Bildschirm"))?.DeviceName;
+        let now = Instant::now();
         Ok(Self {
-            output,
-            duplication,
+            name,
+            luid: gpu.luid,
+            duplication: Some(duplication),
             device: gpu.device.clone(),
             context: gpu.context.clone(),
             latest: None,
@@ -181,16 +233,24 @@ impl ScreenGrabber {
             rotation,
             pointer: Pointer::default(),
             shape_buffer: Vec::new(),
+            updates: 0,
+            restarts: 0,
+            last_fresh: now,
+            opened_at: now,
+            losses: 0,
+            retry_at: None,
+            lost_reason: String::new(),
         })
     }
 
     /// Holt das neueste Bild, falls sich etwas geändert hat. Ohne Änderung bleibt `latest` gültig.
     /// Mausbewegungen kommen als eigene Bilder ohne neuen Inhalt (LastPresentTime 0).
     pub fn grab(&mut self) -> Result<()> {
+        self.fresh = false;
+        let Some(duplication) = self.duplication.clone() else { return self.reopen(false) };
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        self.fresh = false;
-        match unsafe { self.duplication.AcquireNextFrame(0, &mut info, &mut resource) } {
+        match unsafe { duplication.AcquireNextFrame(0, &mut info, &mut resource) } {
             Ok(()) => {
                 if info.LastMouseUpdateTime != 0 {
                     self.pointer.visible = info.PointerPosition.Visible.as_bool();
@@ -198,36 +258,88 @@ impl ScreenGrabber {
                 }
                 if info.PointerShapeBufferSize > 0 {
                     // Eine kaputte Form kostet nur den Zeiger, nie das Bild.
-                    let _ = self.read_shape(info.PointerShapeBufferSize);
+                    let _ = self.read_shape(&duplication, info.PointerShapeBufferSize);
                 }
                 if info.LastPresentTime != 0 {
                     self.last_present = info.LastPresentTime;
                     self.fresh = true;
+                    self.updates += 1;
+                    self.last_fresh = Instant::now();
+                    self.losses = 0;
                 }
                 let copied = if info.LastPresentTime != 0 || self.latest.is_none() { self.store(resource) } else { Ok(()) };
-                let _ = unsafe { self.duplication.ReleaseFrame() };
+                let _ = unsafe { duplication.ReleaseFrame() };
                 copied
             }
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(()),
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                // Auflösungswechsel, UAC, Vollbildwechsel, Drehung: neu öffnen, das letzte Bild bleibt
-                // solange stehen. Die Form des Zeigers kommt nach dem Öffnen neu.
-                self.duplication = duplicate(&self.output, &self.device)?;
-                self.rotation = rotation_of(&self.duplication);
-                self.pointer.shape = None;
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                if self.last_fresh.elapsed() >= STALE_REOPEN && self.opened_at.elapsed() >= STALE_REOPEN {
+                    // Windows lehnt eine zweite Aufnahme desselben Bildschirms ab: erst ganz freigeben.
+                    drop(duplication);
+                    self.duplication = None;
+                    return self.reopen(false);
+                }
                 Ok(())
+            }
+            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                // Auflösungswechsel, UAC, Vollbildwechsel, Drehung: alte Aufnahme freigeben und neu
+                // öffnen, das letzte Bild bleibt solange stehen. Die Form des Zeigers kommt danach neu.
+                // Die alte muss ganz weg sein, sonst scheitert das Öffnen (E_INVALIDARG) oder liefert
+                // eine Aufnahme, die sofort wieder verloren ist.
+                drop(duplication);
+                self.duplication = None;
+                self.pointer.shape = None;
+                self.losses += 1;
+                if self.losses > 1 {
+                    // Gleich wieder verloren, ohne dass ein Bild kam: nicht bei jedem Bild neu versuchen.
+                    self.lost_reason = "Zugriff wiederholt verloren".into();
+                    self.retry_at = Some(Instant::now() + RETRY);
+                }
+                self.reopen(true)
             }
             Err(e) => Err(d3d("Bild holen")(e)),
         }
     }
 
+    /// Öffnet die Aufnahme neu, mit frisch gesuchtem Bildschirm. Scheitert das, kommt der nächste
+    /// Versuch nach `RETRY`; bis dahin kommen keine Bilder.
+    fn reopen(&mut self, after_loss: bool) -> Result<()> {
+        let now = Instant::now();
+        if self.retry_at.is_some_and(|at| now < at) {
+            return Err(Error::CaptureLost(format!("Bildschirmaufnahme unterbrochen: {}", self.lost_reason)));
+        }
+        let opened = find_output_by_name(self.luid, &self.name).and_then(|output| duplicate(&output, &self.device));
+        match opened {
+            Ok(duplication) => {
+                self.rotation = rotation_of(&duplication);
+                self.duplication = Some(duplication);
+                self.opened_at = now;
+                self.retry_at = None;
+                if after_loss {
+                    self.restarts += 1;
+                }
+                if self.losses > 2 && self.last_fresh.elapsed() >= LOST_ERROR {
+                    return Err(Error::CaptureLost(format!(
+                        "Bildschirmaufnahme: Der Zugriff geht immer wieder verloren, seit {:.0} s kein neues Bild.",
+                        self.last_fresh.elapsed().as_secs_f64()
+                    )));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.lost_reason = error.to_string();
+                self.retry_at = Some(now + RETRY);
+                Err(error)
+            }
+        }
+    }
+
     /// Liest eine neue Zeigerform und wandelt sie in BGRA mit Alpha (nur bei Änderung).
-    fn read_shape(&mut self, size: u32) -> Result<()> {
+    fn read_shape(&mut self, duplication: &IDXGIOutputDuplication, size: u32) -> Result<()> {
         self.shape_buffer.resize(size as usize, 0);
         let mut required = 0u32;
         let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
         unsafe {
-            self.duplication
+            duplication
                 .GetFramePointerShape(size, self.shape_buffer.as_mut_ptr().cast(), &mut required, &mut info)
                 .map_err(d3d("Mauszeiger"))?;
         }
@@ -533,5 +645,181 @@ mod tests {
         assert_eq!(p.source, Rect::new(10, 0, 22, 10));
         assert_eq!(p.target, Rect::new(0, 1070, 22, 10));
         assert!(place_cursor((1920, 0), (32, 32), (1920, 1080), (1920, 1080)).is_none());
+    }
+}
+
+/// Kosten der Umrechnung mit und ohne Mauszeiger auf echter Hardware messen (GPU-Durchsatz).
+/// Gemessen auf der RTX 3050: ohne Zeiger 0,15–0,19 ms je Bild, mit Zeiger als zweitem Eingang
+/// 0,25–0,27 ms. Ein eigener kleiner Durchgang nur für den Zeigerbereich war teurer (0,5–0,8 ms):
+/// Jeder weitere Aufruf des Video-Prozessors hat einen hohen festen Preis.
+/// `cargo test -p veloframe-win --release -- --ignored converter_cost --nocapture`
+#[cfg(test)]
+mod hardware {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
+
+    fn texture(gpu: &Gpu, width: u32, height: u32, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> ID3D11Texture2D {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32 | if format == DXGI_FORMAT_NV12 { 0 } else { D3D11_BIND_SHADER_RESOURCE.0 as u32 },
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut t = None;
+        unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut t)) }.unwrap();
+        t.unwrap()
+    }
+
+    /// Wartet, bis die GPU alles Bisherige erledigt hat.
+    fn finish(gpu: &Gpu) {
+        unsafe {
+            let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+            let mut query = None;
+            gpu.device.CreateQuery(&desc, Some(&mut query)).unwrap();
+            let query = query.unwrap();
+            gpu.context.End(&query);
+            let mut done = 0u32;
+            while gpu.context.GetData(&query, Some(&mut done as *mut u32 as *mut _), 4, 0).is_err() || done == 0 {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Was Desktop Duplication auf dem Hauptbildschirm gerade meldet (8 s): neue Bilder, nur Maus,
+    /// Zeitüberschreitungen, verlorener Zugriff und das Ergebnis des Neu-Öffnens.
+    /// `cargo test -p veloframe-win --release -- --ignored duplication_probe --nocapture`
+    #[test]
+    #[ignore]
+    fn duplication_probe() {
+        crate::init_process();
+        let (adapter, output, rect) = find_output(Rect::new(0, 0, 1920, 1080)).unwrap();
+        let gpu = Gpu::new(&adapter, false).unwrap();
+        let mut duplication = duplicate(&output, &gpu.device).unwrap();
+        let desc = unsafe { duplication.GetDesc() };
+        println!("Bildschirm {rect:?}, Format {:?}, Drehung {:?}, Bild im Systemspeicher {}", desc.ModeDesc.Format, desc.Rotation, desc.DesktopImageInSystemMemory.as_bool());
+        let (mut fresh, mut mouse, mut timeout, mut lost, mut other) = (0, 0, 0, 0, 0);
+        let mut reopen: std::collections::BTreeMap<String, u32> = Default::default();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(8) {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            match unsafe { duplication.AcquireNextFrame(16, &mut info, &mut resource) } {
+                Ok(()) => {
+                    if info.LastPresentTime != 0 { fresh += 1 } else { mouse += 1 }
+                    let _ = unsafe { duplication.ReleaseFrame() };
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => timeout += 1,
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    lost += 1;
+                    let result = unsafe {
+                        match output.cast::<IDXGIOutput5>() {
+                            Ok(o5) => o5.DuplicateOutput1(&gpu.device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]),
+                            Err(_) => output.DuplicateOutput(&gpu.device),
+                        }
+                    };
+                    match result {
+                        Ok(d) => {
+                            duplication = d;
+                            *reopen.entry("ok".into()).or_default() += 1;
+                        }
+                        Err(e) => *reopen.entry(format!("{:?}", e.code())).or_default() += 1,
+                    }
+                }
+                Err(e) => {
+                    other += 1;
+                    if other < 3 {
+                        println!("Fehler: {e:?}");
+                    }
+                }
+            }
+        }
+        println!("neue Bilder {fresh}, nur Maus {mouse}, Zeitüberschreitung {timeout}, Zugriff verloren {lost}, andere Fehler {other}");
+        println!("Neu öffnen: {reopen:?}");
+    }
+
+    /// Kosten fürs Neu-Öffnen mit frisch aufgezählten Bildschirmen auf einem bestehenden Gerät, für
+    /// jeden Bildschirm: Aufzählen, Öffnen, erstes Bild (und ob es als neues Bild zählt).
+    /// `cargo test -p veloframe-win --release -- --ignored reopen_cost --nocapture`
+    #[test]
+    #[ignore]
+    fn reopen_cost() {
+        crate::init_process();
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+        let mut screens = Vec::new();
+        let mut a = 0;
+        while let Ok(adapter) = unsafe { factory.EnumAdapters1(a) } {
+            a += 1;
+            let mut o = 0;
+            while let Ok(output) = unsafe { adapter.EnumOutputs(o) } {
+                o += 1;
+                let desc = unsafe { output.GetDesc() }.unwrap();
+                if desc.AttachedToDesktop.as_bool() {
+                    screens.push((adapter.cast::<IDXGIAdapter>().unwrap(), to_rect(desc.DesktopCoordinates)));
+                }
+            }
+        }
+        for (adapter, rect) in screens {
+            let gpu = Gpu::new(&adapter, false).unwrap();
+            println!("Bildschirm {rect:?}");
+            for round in 0..5 {
+                let t = std::time::Instant::now();
+                let (_, output, _) = find_output(rect).unwrap();
+                let enumerated = t.elapsed();
+                let duplication = duplicate(&output, &gpu.device).unwrap();
+                let opened = t.elapsed();
+                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource: Option<IDXGIResource> = None;
+                let first = unsafe { duplication.AcquireNextFrame(500, &mut info, &mut resource) };
+                let got = t.elapsed();
+                if first.is_ok() {
+                    let _ = unsafe { duplication.ReleaseFrame() };
+                }
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                println!(
+                    "  Runde {round}: aufzählen {:.2} ms, öffnen {:.2} ms, erstes Bild nach {:.2} ms ({}, neues Bild: {}, Bild vorhanden: {})",
+                    ms(enumerated),
+                    ms(opened - enumerated),
+                    ms(got - opened),
+                    if first.is_ok() { "ok".to_string() } else { format!("{:?}", first.unwrap_err().code()) },
+                    info.LastPresentTime != 0,
+                    resource.is_some()
+                );
+                drop(duplication);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn converter_cost() {
+        let (adapter, _, _) = find_output(Rect::new(0, 0, 1920, 1080)).unwrap();
+        let gpu = Gpu::new(&adapter, false).unwrap();
+        let input = texture(&gpu, 1920, 1080, DXGI_FORMAT_B8G8R8A8_UNORM);
+        let outputs: Vec<ID3D11Texture2D> = (0..4).map(|_| texture(&gpu, 1920, 1080, DXGI_FORMAT_NV12)).collect();
+        let mut converter = Converter::new(&gpu, (1920, 1080), Rotation::Identity, (1920, 1080), 60).unwrap();
+        let shape = CursorImage { width: 32, height: 32, hotspot: (0, 0), bgra: vec![200; 32 * 32 * 4] };
+        let pointer = Pointer { visible: true, position: (700, 400), shape: Some(shape), version: 1 };
+        for round in 0..3 {
+            for with_cursor in [false, true] {
+                let n = 300;
+                for o in &outputs {
+                    converter.convert(&input, o, 0, with_cursor.then_some(&pointer)).unwrap();
+                }
+                finish(&gpu);
+                let start = std::time::Instant::now();
+                for i in 0..n {
+                    converter.convert(&input, &outputs[i % outputs.len()], 0, with_cursor.then_some(&pointer)).unwrap();
+                }
+                finish(&gpu);
+                println!("Runde {round}, Zeiger {}: {:.3} ms je Bild (GPU, Durchsatz)", if with_cursor { "an " } else { "aus" }, start.elapsed().as_secs_f64() * 1000.0 / n as f64);
+            }
+        }
     }
 }
