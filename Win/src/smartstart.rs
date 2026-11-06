@@ -249,12 +249,19 @@ impl SmartStart {
     /// Kodiert die Bilder mit Anzeigezeit in `start..end` neu. `gop`: die Pakete vom Keyframe vor
     /// `start` bis vor den nächsten Keyframe (Dekodierreihenfolge), `sets`: ihre Parametersätze.
     pub fn reencode(&mut self, sets: &ParameterSets, gop: &[(Vec<u8>, PacketInfo)], start: i64, end: i64) -> Result<Lead> {
+        // Threads, die Encoder und Decoder jetzt anlegen, laufen höher als das Spiel (wie bei der
+        // Aufnahme, siehe `threads`): Sonst dauert das Speichern unter Spiellast mehrere Sekunden.
+        let before = crate::threads::of_process();
         let warm = self.encoder.take().and_then(|mut warm| warm.restart().then_some(warm));
+        let t = Instant::now();
         let mut encoder = match warm {
             Some(warm) => warm,
             None => HardwareEncoder::create(&self.gpu.device, self.gpu.luid, &self.plan).map_err(|e| Error::Save(e.to_string()))?,
         };
-        let result = reencode(&self.gpu, &self.plan, &mut encoder, sets, gop, start, end);
+        if crate::trace() {
+            eprintln!("trace: Speichern: Encoder bereit nach {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let result = reencode(&self.gpu, &self.plan, &mut encoder, sets, gop, start, end, &before);
         // Nur ein Encoder, der sauber durchgelaufen ist, bleibt für das nächste Mal.
         if result.is_ok() {
             self.encoder = Some(encoder);
@@ -263,9 +270,24 @@ impl SmartStart {
     }
 }
 
-fn reencode(gpu: &Gpu, plan: &EncoderPlan, encoder: &mut HardwareEncoder, sets: &ParameterSets, gop: &[(Vec<u8>, PacketInfo)], start: i64, end: i64) -> Result<Lead> {
+#[allow(clippy::too_many_arguments)]
+fn reencode(
+    gpu: &Gpu,
+    plan: &EncoderPlan,
+    encoder: &mut HardwareEncoder,
+    sets: &ParameterSets,
+    gop: &[(Vec<u8>, PacketInfo)],
+    start: i64,
+    end: i64,
+    before: &std::collections::HashSet<u32>,
+) -> Result<Lead> {
     media_foundation().map_err(|e| Error::Save(e.to_string()))?;
+    let t = Instant::now();
     let decoder = Decoder::open(gpu, plan.codec, plan)?;
+    let raised = crate::threads::raise_new(before);
+    if crate::trace() {
+        eprintln!("trace: Speichern: Decoder bereit nach {:.0} ms, {} Threads angehoben", t.elapsed().as_secs_f64() * 1000.0, raised.len());
+    }
     let mut packets: Vec<(Vec<u8>, PacketInfo)> = Vec::new();
     let mut header: Option<ParameterSets> = None;
     // Je Bild höchstens so lange auf den Encoder warten (normal: wenige ms).

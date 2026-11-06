@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, IDXGIAdapter, IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
@@ -77,8 +77,13 @@ pub(crate) fn adapter_by_luid(luid: u64) -> Result<IDXGIAdapter> {
 }
 
 impl Gpu {
-    /// D3D11-Gerät mit Videofunktionen auf `adapter`. `low_priority`: GPU-Arbeit hinter dem Spiel einreihen.
-    pub fn new(adapter: &IDXGIAdapter, low_priority: bool) -> Result<Self> {
+    /// D3D11-Gerät mit Videofunktionen auf `adapter`.
+    ///
+    /// Die GPU-Arbeit läuft mit normaler Priorität. Hinter dem Spiel eingereiht (−4, früher im
+    /// Performance-Modus) wartete die Umrechnung bei voller GPU zu lange, bis zu 26 % der Bilder gingen
+    /// verloren; dem Spiel brachte das gemessen nichts (2–3 % weniger Bilder/s so oder so, die
+    /// Umrechnung kostet 0,15–0,27 ms pro Bild).
+    pub fn new(adapter: &IDXGIAdapter) -> Result<Self> {
         let luid = crate::encode::luid_u64(unsafe { adapter.GetDesc() }.map_err(d3d("Grafikkarte"))?.AdapterLuid);
         let mut device = None;
         let mut context = None;
@@ -102,11 +107,6 @@ impl Gpu {
             // Der Encoder benutzt das Gerät aus eigenen Threads.
             if let Ok(mt) = device.cast::<ID3D11Multithread>() {
                 let _ = mt.SetMultithreadProtected(true);
-            }
-            if low_priority {
-                if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
-                    let _ = dxgi.SetGPUThreadPriority(-4);
-                }
             }
         }
         Ok(Self { device, context, luid })
@@ -699,7 +699,7 @@ mod hardware {
     fn duplication_probe() {
         crate::init_process();
         let (adapter, output, rect) = find_output(Rect::new(0, 0, 1920, 1080)).unwrap();
-        let gpu = Gpu::new(&adapter, false).unwrap();
+        let gpu = Gpu::new(&adapter).unwrap();
         let mut duplication = duplicate(&output, &gpu.device).unwrap();
         let desc = unsafe { duplication.GetDesc() };
         println!("Bildschirm {rect:?}, Format {:?}, Drehung {:?}, Bild im Systemspeicher {}", desc.ModeDesc.Format, desc.Rotation, desc.DesktopImageInSystemMemory.as_bool());
@@ -765,7 +765,7 @@ mod hardware {
             }
         }
         for (adapter, rect) in screens {
-            let gpu = Gpu::new(&adapter, false).unwrap();
+            let gpu = Gpu::new(&adapter).unwrap();
             println!("Bildschirm {rect:?}");
             for round in 0..5 {
                 let t = std::time::Instant::now();
@@ -800,7 +800,7 @@ mod hardware {
     #[ignore]
     fn converter_cost() {
         let (adapter, _, _) = find_output(Rect::new(0, 0, 1920, 1080)).unwrap();
-        let gpu = Gpu::new(&adapter, false).unwrap();
+        let gpu = Gpu::new(&adapter).unwrap();
         let input = texture(&gpu, 1920, 1080, DXGI_FORMAT_B8G8R8A8_UNORM);
         let outputs: Vec<ID3D11Texture2D> = (0..4).map(|_| texture(&gpu, 1920, 1080, DXGI_FORMAT_NV12)).collect();
         let mut converter = Converter::new(&gpu, (1920, 1080), Rotation::Identity, (1920, 1080), 60).unwrap();

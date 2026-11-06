@@ -131,7 +131,7 @@ fn setup(request: &BufferRequest) -> Result<(Pipeline, EncoderPlan, ReplayBuffer
     request.screen = rect; // aufgenommen wird immer der ganze Bildschirm
     let plan = clip::plan(&request, hevc)?;
 
-    let gpu = Gpu::new(&adapter, plan.low_gpu_priority)?;
+    let gpu = Gpu::new(&adapter)?;
     let grabber = ScreenGrabber::new(output, rect, &gpu)?;
     let encoder = HardwareEncoder::create(&gpu.device, gpu.luid, &plan)?;
     let converter = Converter::new(&gpu, (grabber.width, grabber.height), grabber.rotation, (plan.width, plan.height), plan.fps)?;
@@ -267,6 +267,27 @@ fn feed(encoder: &mut HardwareEncoder, pending: &mut VecDeque<(windows::Win32::M
     Ok(())
 }
 
+/// Längste Dauer je Schritt des Aufnahme-Threads seit `since` (nur zum Messen, `VELOFRAME_TRACE`).
+struct Slowest {
+    since: Instant,
+    /// Wie viel zu spät der Thread nach dem Warten dran war.
+    wake: Duration,
+    serve: Duration,
+    grab: Duration,
+    convert: Duration,
+    submit: Duration,
+    drain: Duration,
+    /// Schritte, die länger als eine Bilddauer brauchten.
+    over: u32,
+}
+
+impl Default for Slowest {
+    fn default() -> Self {
+        let zero = Duration::ZERO;
+        Self { since: Instant::now(), wake: zero, serve: zero, grab: zero, convert: zero, submit: zero, drain: zero, over: 0 }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     mut p: Pipeline,
@@ -278,6 +299,7 @@ fn run(
     shared: Arc<Mutex<Shared>>,
     origin: i64,
     lag: Arc<AtomicI64>,
+    raised: Vec<u32>,
 ) {
     let _timer = TimerResolution::begin();
     let _mmcss = MmcssCapture::join();
@@ -297,15 +319,19 @@ fn run(
     let mut error: Option<String> = None;
     let mut pending = VecDeque::with_capacity(MAX_PENDING + 1);
     let mut lag_samples = 0u32;
+    let trace = crate::trace();
+    let mut slow = Slowest::default();
 
     while !stop.load(Ordering::Relaxed) {
         // Bis zum nächsten Bildzeitpunkt in kleinen Schritten den Encoder bedienen: Pakete abholen,
         // wartende Bilder nachreichen, sobald er bereit ist.
         let deadline = start + period * frame as u32;
         loop {
+            let t = Instant::now();
             if let Err(e) = drain(&mut p.encoder, &shared).and_then(|()| feed(&mut p.encoder, &mut pending, &mut encoded)) {
                 error = Some(e.to_string());
             }
+            slow.serve = slow.serve.max(t.elapsed());
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -313,6 +339,7 @@ fn run(
             std::thread::sleep((deadline - now).min(Duration::from_millis(2)));
         }
         let now = Instant::now();
+        slow.wake = slow.wake.max(now - deadline);
         if now - deadline > period * 2 {
             let behind = ((now - start).as_secs_f64() * plan.fps as f64) as u64;
             if encoded > 0 {
@@ -321,8 +348,11 @@ fn run(
             frame = behind;
         }
 
+        let step_start = Instant::now();
         let step = (|| -> Result<()> {
+            let t = Instant::now();
             p.grabber.grab()?;
+            slow.grab = slow.grab.max(t.elapsed());
             if p.grabber.fresh {
                 // Wie alt das Bild beim Abholen ist (sein Zeitstempel minus Anzeigezeit). Gleitend
                 // gemittelt über etwa 2 s bei 60 fps: Der Ton liegt um so viel später, damit beide
@@ -360,6 +390,7 @@ fn run(
             }
             let Some(latest) = p.grabber.latest.clone() else { return Ok(()) };
             // Pünktlich umrechnen und einreihen; abgeholt wird, sobald der Encoder bereit ist.
+            let t = Instant::now();
             match p.encoder.free_frame()? {
                 Some((sample, texture, slice)) => {
                     let pointer = cursor.load(Ordering::Relaxed).then_some(&p.grabber.pointer);
@@ -381,13 +412,35 @@ fn run(
                     }
                 }
             }
+            slow.convert = slow.convert.max(t.elapsed());
+            let t = Instant::now();
             feed(&mut p.encoder, &mut pending, &mut encoded)?;
-            drain(&mut p.encoder, &shared)
+            slow.submit = slow.submit.max(t.elapsed());
+            let t = Instant::now();
+            let drained = drain(&mut p.encoder, &shared);
+            slow.drain = slow.drain.max(t.elapsed());
+            drained
         })();
         if let Err(e) = step {
             error = Some(e.to_string());
         }
+        if step_start.elapsed() > period {
+            slow.over += 1;
+        }
         frame += 1;
+        if trace && slow.since.elapsed() >= Duration::from_secs(2) {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "trace: wach {:5.1} | bedienen {:5.1} | holen {:5.1} | umrechnen {:5.1} | abgeben {:5.1} | abholen {:5.1} ms | {} Schritte > Bild | belegt {busy} voll {pool_full} spät {late} | wartend {}",
+                ms(slow.wake), ms(slow.serve), ms(slow.grab), ms(slow.convert), ms(slow.submit), ms(slow.drain), slow.over, pending.len()
+            );
+            slow = Slowest::default();
+            if (20..22).contains(&start.elapsed().as_secs()) {
+                for (id, ms, priority) in crate::threads::usage().into_iter().take(14) {
+                    eprintln!("trace: Thread {id:>6}: {ms:>8.0} ms CPU, Priorität {priority:>2}{}", if raised.contains(&id) { ", angehoben" } else { "" });
+                }
+            }
+        }
 
         if encoded > 0 && window_start.elapsed() >= Duration::from_secs(2) {
             let (frames, lost) = (encoded - window_encoded + busy - window_busy, busy - window_busy);
@@ -463,25 +516,33 @@ impl Recorder {
             let (stop, cursor, shared, lag) = (stop.clone(), cursor.clone(), shared.clone(), lag.clone());
             std::thread::Builder::new()
                 .name("veloframe-video".into())
-                .spawn(move || match setup(&request) {
-                    Ok((pipeline, plan, buffer, screen)) => {
-                        {
-                            let mut s = shared.lock().unwrap();
-                            s.buffer = Some(buffer);
-                            s.status = BufferStatus {
-                                running: true,
-                                plan: Some(plan.clone()),
-                                encoder: Some(pipeline.encoder.name.clone()),
-                                applied: pipeline.encoder.applied.clone(),
-                                cursor_error: pipeline.converter.cursor_error.clone(),
-                                ..Default::default()
-                            };
+                .spawn(move || {
+                    // Threads, die beim Einrichten entstehen, gehören zu Encoder, Treiber und Media
+                    // Foundation: Sie bekommen eine höhere Priorität (siehe `threads`).
+                    let before = crate::threads::of_process();
+                    match setup(&request) {
+                        Ok((pipeline, plan, buffer, screen)) => {
+                            let raised = crate::threads::raise_new(&before);
+                            let mut applied = pipeline.encoder.applied.clone();
+                            applied.push(format!("{} Encoder-Threads höher priorisiert", raised.len()));
+                            {
+                                let mut s = shared.lock().unwrap();
+                                s.buffer = Some(buffer);
+                                s.status = BufferStatus {
+                                    running: true,
+                                    plan: Some(plan.clone()),
+                                    encoder: Some(pipeline.encoder.name.clone()),
+                                    applied,
+                                    cursor_error: pipeline.converter.cursor_error.clone(),
+                                    ..Default::default()
+                                };
+                            }
+                            let _ = ready_tx.send(Ok((plan.clone(), screen, pipeline.gpu.luid)));
+                            run(pipeline, plan, screen, frames_rx, stop, cursor, shared, origin, lag, raised);
                         }
-                        let _ = ready_tx.send(Ok((plan.clone(), screen, pipeline.gpu.luid)));
-                        run(pipeline, plan, screen, frames_rx, stop, cursor, shared, origin, lag);
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                        }
                     }
                 })
                 .map_err(|e| Error::Capture(format!("Aufnahme-Thread: {e}")))?
@@ -545,7 +606,11 @@ impl Recorder {
         }
         let mut smart = self.smart_start.lock().unwrap();
         if smart.is_none() {
-            *smart = Some(smartstart::SmartStart::new(Gpu::new(&adapter_by_luid(self.luid)?, false)?, &self.plan));
+            let t = Instant::now();
+            *smart = Some(smartstart::SmartStart::new(Gpu::new(&adapter_by_luid(self.luid)?)?, &self.plan));
+            if crate::trace() {
+                eprintln!("trace: Speichern: GPU-Gerät nach {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
         }
         smart.as_mut().unwrap().reencode(&snapshot.sets, &gop, start, end)
     }

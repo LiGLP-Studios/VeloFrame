@@ -138,8 +138,6 @@ pub struct EncoderPlan {
     pub quality_vs_speed: u32,
     pub storage: Storage,
     pub seconds: u32,
-    /// GPU-Arbeit der Engine hinter dem Spiel einreihen.
-    pub low_gpu_priority: bool,
     /// Ton; `None` ohne Ton.
     pub audio: Option<AudioPlan>,
 }
@@ -207,11 +205,11 @@ pub fn plan(request: &BufferRequest, hevc_available: bool) -> crate::Result<Enco
         max_bitrate *= 0.65;
     }
     let max_bitrate = max_bitrate.clamp(1e6, 150e6) as u32;
-    let (mean_factor, gop_seconds, b_frames, quality_vs_speed, storage, low_gpu_priority) = match request.mode {
+    let (mean_factor, gop_seconds, b_frames, quality_vs_speed, storage) = match request.mode {
         // Stufe 85: gemessen der beste Kompromiss. Bei 100 schafft z. B. die RTX 3050 HEVC 1080p60
         // nicht immer, wenn andere Programme die GPU mitbenutzen (verworfene Bilder).
-        ClipMode::Performance => (0.6, 2, 2, 85, Storage::File, true),
-        ClipMode::Long => (0.85, 1, 0, 70, Storage::File, false),
+        ClipMode::Performance => (0.6, 2, 2, 85, Storage::File),
+        ClipMode::Long => (0.85, 1, 0, 70, Storage::File),
     };
     Ok(EncoderPlan {
         mode: request.mode,
@@ -226,7 +224,6 @@ pub fn plan(request: &BufferRequest, hevc_available: bool) -> crate::Result<Enco
         quality_vs_speed,
         storage: request.storage.unwrap_or(storage),
         seconds: request.seconds,
-        low_gpu_priority,
         audio: crate::audio::plan(&request.audio, request.mode)?,
     })
 }
