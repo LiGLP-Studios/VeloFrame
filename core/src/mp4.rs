@@ -1,7 +1,9 @@
 //! MP4-Schreiber für H.264 und HEVC, mit AAC-Tonspuren.
 //!
 //! - Nimmt die Pakete des Encoders (Annex-B mit Startcodes) und schreibt sie als normale MP4-Datei.
-//! - Tonspuren (AAC-LC, `mp4a` + `esds`) liegen auf derselben Uhr wie das Bild. Die Bearbeitungsliste
+//! - Tonspuren (AAC-LC, `mp4a` + `esds`) liegen auf derselben Uhr wie das Bild. Ihre `trak`-Boxen
+//!   stehen in umgekehrter Reihenfolge (Spur-IDs bleiben aufsteigend): Media Foundation spielt die
+//!   zuletzt stehende Tonspur, Chromium die aktive, beide also die erste. Die Bearbeitungsliste
 //!   (`elst`) gleicht die Verzögerung des AAC-Encoders und den Versatz zum ersten Bild aus: Das erste
 //!   Sample spielt genau zu seiner Zeit.
 //! - Video und Ton liegen in Blöcken von 0,5 s abwechselnd in der Datei (Interleaving), damit Browser
@@ -12,6 +14,14 @@
 //!   wird dabei nie komplett im Speicher gehalten, nur das jeweils aktuelle Paket.
 //! - Parametersätze (SPS/PPS/VPS) wandern in den Kopf (`avcC`/`hvcC`), Zugriffstrenner (AUD) fallen
 //!   weg, alles andere bleibt unverändert: Es wird nichts neu kodiert.
+//! - Bildgenauer Anfang („Smart Start“): Der neu kodierte Anfang bis zum nächsten Keyframe kann eigene
+//!   Parametersätze haben; dann bekommt die Videospur zwei Sample-Beschreibungen (`stsd`), und die
+//!   Blöcke wechseln genau an der Grenze. Ohne Decoder für den Codec (dann spielt ihn auch kein
+//!   Player mit Media Foundation) beginnt die Wiedergabe stattdessen per Bearbeitungsliste (`skip`).
+//! - Videospur ohne `media_time` in der Bearbeitungsliste: Media Foundation (Windows-Player) wendet
+//!   `media_time` mit falschem Vorzeichen an (gemessen, beim Ton wie beim Bild). Stattdessen werden
+//!   die Zeitversätze der Bilder (`ctts`, Version 1, auch negativ) so verschoben, dass das erste
+//!   angezeigte Bild bei 0 liegt. Das spielen alle Player gleich, auch solche ohne Bearbeitungslisten.
 
 use crate::audio::FRAME_SAMPLES;
 use crate::clip::VideoCodec;
@@ -266,6 +276,13 @@ pub struct VideoTrack<'a> {
     pub height: u32,
     pub sets: &'a ParameterSets,
     pub infos: &'a [PacketInfo],
+    /// Neu kodierter Anfang mit eigenen Parametersätzen: Die ersten `n` Samples gehören zu diesen
+    /// (erste Sample-Beschreibung), der Rest zu `sets`.
+    pub lead: Option<(&'a ParameterSets, usize)>,
+    /// So viel später (100 ns) als das erste angezeigte Bild beginnt die Wiedergabe, per
+    /// `media_time` in der Bearbeitungsliste. Nur benutzen, wenn kein Player mit Media Foundation
+    /// den Clip abspielen kann (dort wirkt `media_time` falsch herum).
+    pub skip: i64,
 }
 
 /// Eine AAC-Tonspur. Ein Paket ist ein AAC-Frame (1024 Samples), die Pakete folgen lückenlos
@@ -320,14 +337,15 @@ struct TrackLayout {
     chunks: Vec<(usize, usize)>,
 }
 
-/// Teilt die Samples einer Spur in Blöcke von 0,5 s (gemessen ab `base`).
-fn chunk(times: &[i64], base: i64) -> Vec<(usize, usize)> {
+/// Teilt die Samples einer Spur in Blöcke von 0,5 s (gemessen ab `base`). An `split` beginnt in
+/// jedem Fall ein neuer Block (Wechsel der Sample-Beschreibung).
+fn chunk(times: &[i64], base: i64, split: Option<usize>) -> Vec<(usize, usize)> {
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut current = None;
     for (i, &t) in times.iter().enumerate() {
         let key = (t - base).div_euclid(CHUNK_TICKS);
         match (current, chunks.last_mut()) {
-            (Some(k), Some(last)) if k == key => last.1 += 1,
+            (Some(k), Some(last)) if k == key && split != Some(i) => last.1 += 1,
             _ => {
                 chunks.push((i, 1));
                 current = Some(key);
@@ -403,20 +421,22 @@ fn esds(b: &mut Boxes, track: &AudioTrack, place: &AudioPlacement) {
     b.end(at);
 }
 
-/// `stsc` und `co64` einer Spur aus ihren Blöcken.
-fn chunk_tables(b: &mut Boxes, chunks: &[(usize, usize)], offsets: &[u64]) {
+/// `stsc` und `co64` einer Spur aus ihren Blöcken. `description`: Nummer der Sample-Beschreibung
+/// für den Block, der mit diesem Sample beginnt.
+fn chunk_tables(b: &mut Boxes, chunks: &[(usize, usize)], offsets: &[u64], description: impl Fn(usize) -> u32) {
     let stsc = b.full(b"stsc", 0, 0);
-    let mut runs: Vec<(u32, u32)> = Vec::new();
-    for (i, &(_, count)) in chunks.iter().enumerate() {
-        if runs.last().is_none_or(|&(_, c)| c != count as u32) {
-            runs.push((i as u32 + 1, count as u32));
+    let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+    for (i, &(first, count)) in chunks.iter().enumerate() {
+        let index = description(first);
+        if runs.last().is_none_or(|&(_, c, d)| c != count as u32 || d != index) {
+            runs.push((i as u32 + 1, count as u32, index));
         }
     }
     b.u32(runs.len() as u32);
-    for (first, count) in runs {
+    for (first, count, index) in runs {
         b.u32(first);
         b.u32(count);
-        b.u32(1);
+        b.u32(index);
     }
     b.end(stsc);
     let co64 = b.full(b"co64", 0, 0);
@@ -517,12 +537,29 @@ pub fn write_mp4(
         .map(|i| samples.get(i + 1).map_or(last_duration, |next| (next.dts - samples[i].dts).max(1)) as u32)
         .collect();
     let media_duration: u64 = durations.iter().map(|&d| d as u64).sum();
+    // Mit B-Frames liegt das erste angezeigte Bild nach dem ersten dekodierten. Statt es per
+    // `media_time` anzusteuern (falsches Vorzeichen in Media Foundation), rücken alle Anzeigezeiten
+    // um diesen Versatz nach vorn: Das erste angezeigte Bild liegt dann genau bei 0.
     let first_pts = samples.iter().map(|s| s.pts).min().unwrap_or(0).max(0);
-    let shown = media_duration.saturating_sub(first_pts as u64).max(1);
+    for s in &mut samples {
+        s.pts -= first_pts;
+    }
+    // Sichtdauer: bis zum Ende des zuletzt angezeigten Bildes (mit B-Frames ist das nicht das zuletzt
+    // dekodierte).
+    let shown = samples.iter().zip(infos).map(|(s, i)| s.pts + to_media(i.duration).max(1)).max().unwrap_or(1).max(1) as u64;
+    // Ohne Decoder (kein Player mit Media Foundation): Wiedergabe per Bearbeitungsliste später beginnen.
+    let skip = to_media(video.skip.max(0)).min(shown as i64 - 1).max(0);
+    let shown = shown - skip as u64;
     let movie_duration = shown * MOVIE_TIMESCALE as u64 / MEDIA_TIMESCALE as u64;
     // Erstes sichtbares Bild und Sichtdauer auf der gemeinsamen Uhr (100 ns).
-    let video_start = base + first_pts * TICKS_PER_SECOND / MEDIA_TIMESCALE as i64;
+    let video_start = base + (first_pts + skip) * TICKS_PER_SECOND / MEDIA_TIMESCALE as i64;
     let video_length = shown as i64 * TICKS_PER_SECOND / MEDIA_TIMESCALE as i64;
+    let lead = video.lead.filter(|&(_, n)| n > 0 && n < infos.len());
+    if let Some((lead_sets, _)) = lead {
+        if !lead_sets.is_complete(codec) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Parametersätze des neu kodierten Anfangs fehlen."));
+        }
+    }
 
     let mut layouts = vec![TrackLayout { sizes: samples.iter().map(|s| s.size).collect(), times: infos.iter().map(|i| i.dts).collect(), chunks: Vec::new() }];
     let mut placed: Vec<(usize, AudioPlacement)> = Vec::new();
@@ -543,7 +580,7 @@ pub fn write_mp4(
     let clip_base = layouts.iter().filter_map(|l| l.times.first().copied()).min().unwrap_or(base);
     let mut order: Vec<(i64, usize, usize)> = Vec::new(); // (Block-Zeit, Spur, Block)
     for (track, layout) in layouts.iter_mut().enumerate() {
-        layout.chunks = chunk(&layout.times, clip_base);
+        layout.chunks = chunk(&layout.times, clip_base, if track == 0 { lead.map(|(_, n)| n) } else { None });
         for (c, &(first, _)) in layout.chunks.iter().enumerate() {
             order.push(((layout.times[first] - clip_base).div_euclid(CHUNK_TICKS), track, c));
         }
@@ -592,12 +629,13 @@ pub fn write_mp4(
 
         let trak = b.start(b"trak");
         tkhd(&mut b, 1, true, movie_duration, 0, 0, video.width, video.height);
-        // Bearbeitungsliste: Wiedergabe beginnt beim ersten angezeigten Bild (wichtig mit B-Frames).
+        // Bearbeitungsliste: eine Bearbeitung ab 0 (die Anzeigezeiten sind schon verschoben), mit
+        // `skip` ab dort.
         let edts = b.start(b"edts");
         let elst = b.full(b"elst", 1, 0);
         b.u32(1);
         b.u64(movie_duration);
-        b.u64(first_pts as u64);
+        b.u64(skip as u64);
         b.u16(1);
         b.u16(0);
         b.end(elst);
@@ -613,37 +651,43 @@ pub fn write_mp4(
 
         let stbl = b.start(b"stbl");
         let stsd = b.full(b"stsd", 0, 0);
-        b.u32(1);
-        let entry = b.start(if codec == VideoCodec::H264 { b"avc1" } else { b"hvc1" });
-        b.bytes(&[0; 6]);
-        b.u16(1); // data_reference_index
-        b.bytes(&[0; 16]);
-        b.u16(video.width as u16);
-        b.u16(video.height as u16);
-        b.u32(0x0048_0000);
-        b.u32(0x0048_0000);
-        b.u32(0);
-        b.u16(1);
-        let mut name = [0u8; 32];
-        let label = b"VeloFrame";
-        name[0] = label.len() as u8;
-        name[1..1 + label.len()].copy_from_slice(label);
-        b.bytes(&name);
-        b.u16(0x0018);
-        b.u16(0xFFFF);
-        match codec {
-            VideoCodec::H264 => avcc(&mut b, sets),
-            VideoCodec::Hevc => hvcc(&mut b, sets),
+        let descriptions: Vec<&ParameterSets> = match lead {
+            Some((lead_sets, _)) => vec![lead_sets, sets],
+            None => vec![sets],
+        };
+        b.u32(descriptions.len() as u32);
+        for sets in descriptions {
+            let entry = b.start(if codec == VideoCodec::H264 { b"avc1" } else { b"hvc1" });
+            b.bytes(&[0; 6]);
+            b.u16(1); // data_reference_index
+            b.bytes(&[0; 16]);
+            b.u16(video.width as u16);
+            b.u16(video.height as u16);
+            b.u32(0x0048_0000);
+            b.u32(0x0048_0000);
+            b.u32(0);
+            b.u16(1);
+            let mut name = [0u8; 32];
+            let label = b"VeloFrame";
+            name[0] = label.len() as u8;
+            name[1..1 + label.len()].copy_from_slice(label);
+            b.bytes(&name);
+            b.u16(0x0018);
+            b.u16(0xFFFF);
+            match codec {
+                VideoCodec::H264 => avcc(&mut b, sets),
+                VideoCodec::Hevc => hvcc(&mut b, sets),
+            }
+            // Farbangaben: BT.709, eingeschränkter Wertebereich (wie der Encoder es schreibt).
+            let colr = b.start(b"colr");
+            b.bytes(b"nclx");
+            b.u16(1);
+            b.u16(1);
+            b.u16(1);
+            b.u8(0);
+            b.end(colr);
+            b.end(entry);
         }
-        // Farbangaben: BT.709, eingeschränkter Wertebereich (wie der Encoder es schreibt).
-        let colr = b.start(b"colr");
-        b.bytes(b"nclx");
-        b.u16(1);
-        b.u16(1);
-        b.u16(1);
-        b.u8(0);
-        b.end(colr);
-        b.end(entry);
         b.end(stsd);
 
         let stts = b.full(b"stts", 0, 0);
@@ -687,14 +731,18 @@ pub fn write_mp4(
             b.u32(k);
         }
         b.end(stss);
-        chunk_tables(&mut b, &layouts[0].chunks, &offsets[0]);
+        let lead_samples = lead.map_or(0, |(_, n)| n);
+        chunk_tables(&mut b, &layouts[0].chunks, &offsets[0], |first| if first < lead_samples { 1 } else { lead.map_or(1, |_| 2) });
         stsz(&mut b, &layouts[0].sizes);
         b.end(stbl);
         b.end(minf);
         b.end(mdia);
         b.end(trak);
 
-        for (n, (t, place)) in placed.iter().enumerate() {
+        // Tonspuren in umgekehrter Reihenfolge: Media Foundation (Windows-Player) zählt die Spuren von
+        // hinten und spielt die erste, die es findet (gemessen; das Flag „aktiv“ beachtet es nicht).
+        // So landet es bei der ersten Spur (Mix bzw. System), wie Chromium, das dem Flag folgt.
+        for (n, (t, place)) in placed.iter().enumerate().rev() {
             let track = &audio[*t];
             let layout = &layouts[n + 1];
             let trak = b.start(b"trak");
@@ -745,7 +793,7 @@ pub fn write_mp4(
             b.u32(layout.sizes.len() as u32);
             b.u32(FRAME_SAMPLES);
             b.end(stts);
-            chunk_tables(&mut b, &layout.chunks, &offsets[n + 1]);
+            chunk_tables(&mut b, &layout.chunks, &offsets[n + 1], |_| 1);
             stsz(&mut b, &layout.sizes);
             b.end(stbl);
             b.end(minf);
@@ -841,7 +889,7 @@ mod tests {
     }
 
     fn write_video(file: &mut Vec<u8>, codec: VideoCodec, width: u32, height: u32, sets: &ParameterSets, infos: &[PacketInfo], packets: &[Vec<u8>]) -> Mp4Info {
-        let video = VideoTrack { codec, width, height, sets, infos };
+        let video = VideoTrack { codec, width, height, sets, infos, lead: None, skip: 0 };
         write_mp4(file, &video, &[], |p, buf| {
             let Packet::Video(i) = p else { panic!("kein Ton erwartet") };
             buf.extend_from_slice(&packets[i.min(packets.len() - 1)]);
@@ -858,9 +906,25 @@ mod tests {
         u64::from_be_bytes(data[at..at + 8].try_into().unwrap())
     }
 
+    /// Spuren nach ihrer ID sortiert (in der Datei stehen die Tonspuren umgekehrt).
     fn traks(file: &[u8]) -> Vec<&[u8]> {
+        let mut traks = traks_in_file_order(file);
+        traks.sort_by_key(|t| u32_at(find(t, &[b"tkhd"], &[]), 20));
+        traks
+    }
+
+    fn traks_in_file_order(file: &[u8]) -> Vec<&[u8]> {
         let moov = find(file, &[b"moov"], &[]);
         boxes(moov).into_iter().filter(|(k, _)| k == b"trak").map(|(_, d)| d).collect()
+    }
+
+    #[test]
+    fn audio_traks_are_written_last_first() {
+        let (file, _, _, _) = clip_with_audio(1024);
+        let ids: Vec<u32> = traks_in_file_order(&file).iter().map(|t| u32_at(find(t, &[b"tkhd"], &[]), 20)).collect();
+        assert_eq!(ids, [1, 3, 2], "Video, dann die Tonspuren von hinten: Media Foundation spielt die letzte");
+        let last = traks_in_file_order(&file)[2];
+        assert_eq!(find(last, &[b"tkhd"], &[])[3] & 1, 1, "die zuletzt stehende Tonspur ist die aktive");
     }
 
     /// Wo jedes Sample einer Spur in der Datei liegt (aus stsc, co64 und stsz).
@@ -953,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn b_frames_get_ctts_and_an_edit_list() {
+    fn b_frames_start_at_zero_without_media_time() {
         let sps: &[u8] = &[0x67, 0x64, 0x00, 0x28];
         let pps: &[u8] = &[0x68, 0xEE];
         let f = TICKS_PER_SECOND / 25;
@@ -968,9 +1032,70 @@ mod tests {
         let mut file = Vec::new();
         write_video(&mut file, VideoCodec::H264, 640, 360, &sets, &infos, &packets);
         let stbl = find(&file, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"], &[]);
-        assert!(boxes(stbl).iter().any(|(k, _)| k == b"ctts"));
+        let ctts = find(stbl, &[b"ctts"], &[]);
+        assert_eq!(ctts[0], 1, "Version 1: negative Versätze erlaubt");
+        let runs: Vec<(u32, i32)> = (0..u32_at(ctts, 4) as usize).map(|i| (u32_at(ctts, 8 + i * 8), u32_at(ctts, 12 + i * 8) as i32)).collect();
+        // Anzeigezeiten I 0, P 2/25 s, B 1/25 s: das erste angezeigte Bild liegt bei 0.
+        assert_eq!(runs, [(1, 0), (1, 3600), (1, -3600)]);
         let elst = find(&file, &[b"moov", b"trak", b"edts", b"elst"], &[]);
-        assert_eq!(u64::from_be_bytes(elst[16..24].try_into().unwrap()), 3600, "Start beim ersten Bild (1/25 s)");
+        assert_eq!(u64_at(elst, 16), 0, "kein media_time (Media Foundation wendet es falsch an)");
+        assert_eq!(u64_at(elst, 8), 120, "drei Bilder à 40 ms");
+    }
+
+    #[test]
+    fn a_reencoded_lead_gets_its_own_sample_description() {
+        let (sps_a, pps_a): (&[u8], &[u8]) = (&[0x67, 0x64, 0x00, 0x28, 0xA1], &[0x68, 0xEE, 0x01]);
+        let (sps_b, pps_b): (&[u8], &[u8]) = (&[0x67, 0x64, 0x00, 0x28, 0xB2], &[0x68, 0xEE, 0x02]);
+        let f = TICKS_PER_SECOND / 30;
+        // Bild 0–2 neu kodiert (eigene Sätze), ab Bild 3 kopiert (Keyframe mit den Sätzen des Puffers).
+        let packets: Vec<Vec<u8>> = (0..8)
+            .map(|i| match i {
+                0 => annexb(&[sps_a, pps_a, &[0x65, 0]]),
+                3 => annexb(&[sps_b, pps_b, &[0x65, 3]]),
+                _ => annexb(&[&[0x41, i as u8]]),
+            })
+            .collect();
+        let infos: Vec<PacketInfo> = (0..8).map(|i| PacketInfo { pts: i * f, dts: i * f, duration: f, key: i == 0 || i == 3 }).collect();
+        let (lead_sets, sets) = (ParameterSets::from_packet(VideoCodec::H264, &packets[0]), ParameterSets::from_packet(VideoCodec::H264, &packets[3]));
+        let video = VideoTrack { codec: VideoCodec::H264, width: 640, height: 360, sets: &sets, infos: &infos, lead: Some((&lead_sets, 3)), skip: 0 };
+        let mut file = Vec::new();
+        write_mp4(&mut file, &video, &[], |p, buf| {
+            let Packet::Video(i) = p else { unreachable!() };
+            buf.extend_from_slice(&packets[i]);
+            Ok(())
+        })
+        .unwrap();
+        let stbl = find(&file, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"], &[]);
+        let stsd = find(stbl, &[b"stsd"], &[]);
+        assert_eq!(u32_at(stsd, 4), 2, "zwei Sample-Beschreibungen");
+        let entries = boxes(&stsd[8..]);
+        assert!(entries[0].1.windows(5).any(|w| w == sps_a) && entries[1].1.windows(5).any(|w| w == sps_b));
+        // stsc: erster Block (Bild 0–2) Beschreibung 1, ab Bild 3 Beschreibung 2.
+        let stsc = find(stbl, &[b"stsc"], &[]);
+        let runs: Vec<(u32, u32, u32)> = (0..u32_at(stsc, 4) as usize).map(|i| (u32_at(stsc, 8 + i * 12), u32_at(stsc, 12 + i * 12), u32_at(stsc, 16 + i * 12))).collect();
+        assert_eq!(runs, [(1, 3, 1), (2, 5, 2)]);
+        assert_eq!(sample_locations(stbl).len(), 8);
+    }
+
+    #[test]
+    fn skip_starts_playback_later_without_moving_the_frames() {
+        let sps: &[u8] = &[0x67, 0x64, 0x00, 0x28];
+        let pps: &[u8] = &[0x68, 0xEE];
+        let f = TICKS_PER_SECOND / 25;
+        let packets: Vec<Vec<u8>> = (0..10).map(|i| if i == 0 { annexb(&[sps, pps, &[0x65, 0]]) } else { annexb(&[&[0x41, i as u8]]) }).collect();
+        let infos: Vec<PacketInfo> = (0..10).map(|i| PacketInfo { pts: i * f, dts: i * f, duration: f, key: i == 0 }).collect();
+        let sets = ParameterSets::from_packet(VideoCodec::H264, &packets[0]);
+        let video = VideoTrack { codec: VideoCodec::H264, width: 640, height: 360, sets: &sets, infos: &infos, lead: None, skip: 4 * f };
+        let mut file = Vec::new();
+        let info = write_mp4(&mut file, &video, &[], |p, buf| {
+            let Packet::Video(i) = p else { unreachable!() };
+            buf.extend_from_slice(&packets[i]);
+            Ok(())
+        })
+        .unwrap();
+        let elst = find(&file, &[b"moov", b"trak", b"edts", b"elst"], &[]);
+        assert_eq!((u64_at(elst, 8), u64_at(elst, 16)), (240, 4 * 3600), "6 Bilder sichtbar ab Bild 4");
+        assert!((info.duration_seconds - 0.24).abs() < 1e-6);
     }
 
     /// Video ab 0,1 s (30 fps, 2 s), Ton A ab 0,0 s (vor dem Bild), Ton B ab 0,3 s (nach dem Bild).
@@ -996,7 +1121,7 @@ mod tests {
             AudioTrack { name: "VeloFrame Microphone", sample_rate: 48_000, channels: 2, bitrate: 128_000, config: &config, priming, infos: &b_infos },
         ];
         let mut file = Vec::new();
-        let info = write_mp4(&mut file, &VideoTrack { codec: VideoCodec::H264, width: 1280, height: 720, sets: &sets, infos: &infos }, &tracks, |p, buf| {
+        let info = write_mp4(&mut file, &VideoTrack { codec: VideoCodec::H264, width: 1280, height: 720, sets: &sets, infos: &infos, lead: None, skip: 0 }, &tracks, |p, buf| {
             match p {
                 Packet::Video(i) => buf.extend_from_slice(&video[i]),
                 Packet::Audio { track, index } => buf.extend_from_slice(&audio_packets[track][index]),
@@ -1088,7 +1213,7 @@ mod tests {
         let config = crate::audio::aac_lc_config(48_000, 2);
         let track = AudioTrack { name: "x", sample_rate: 48_000, channels: 2, bitrate: 128_000, config: &config, priming: 1024, infos: &late };
         let mut file = Vec::new();
-        let info = write_mp4(&mut file, &VideoTrack { codec: VideoCodec::H264, width: 64, height: 64, sets: &sets, infos: &infos }, &[track], |p, buf| {
+        let info = write_mp4(&mut file, &VideoTrack { codec: VideoCodec::H264, width: 64, height: 64, sets: &sets, infos: &infos, lead: None, skip: 0 }, &[track], |p, buf| {
             match p {
                 Packet::Video(_) => buf.extend_from_slice(&packet),
                 Packet::Audio { .. } => buf.extend_from_slice(&[1, 2, 3]),

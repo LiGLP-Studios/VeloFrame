@@ -1,6 +1,7 @@
 //! Wählt beim Bauen das passende Plattform-Modul (Win, Mac, Linux).
 
 use veloframe_core::audio::{AudioDevice, AudioSetRequest, AudioStatus};
+use veloframe_core::clip::CursorSetRequest;
 use veloframe_core::{BufferRequest, BufferStatus, ClipResult, Result, SaveClipRequest, ScreenshotRequest, ScreenshotResult};
 
 #[cfg(windows)]
@@ -32,6 +33,10 @@ mod imp {
 
         pub fn set_audio(&self, request: &AudioSetRequest) -> Result<AudioStatus> {
             self.recorder.as_ref().ok_or_else(|| Error::InvalidRequest("Der Clip-Puffer läuft nicht.".into()))?.set_audio(request)
+        }
+
+        pub fn set_cursor(&self, request: &CursorSetRequest) -> Result<BufferStatus> {
+            Ok(self.recorder.as_ref().ok_or_else(|| Error::InvalidRequest("Der Clip-Puffer läuft nicht.".into()))?.set_cursor(request))
         }
 
         pub fn start_buffer(&mut self, request: &BufferRequest) -> Result<BufferStatus> {
@@ -133,6 +138,9 @@ mod imp {
             match *self {}
         }
         pub fn start_buffer(&mut self, _: &BufferRequest) -> Result<BufferStatus> {
+            match *self {}
+        }
+        pub fn set_cursor(&self, _: &CursorSetRequest) -> Result<BufferStatus> {
             match *self {}
         }
         pub fn buffer_status(&self) -> BufferStatus {

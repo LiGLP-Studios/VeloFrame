@@ -7,8 +7,10 @@
 //! 3. freies Bild aus dem Encoder-Pool nehmen, auf der GPU nach NV12 umrechnen und in die
 //!    Warteschlange stellen (bis zu 4 Bilder); der Encoder holt sie ab, sobald er bereit ist
 //!
-//! Die CPU fasst dabei kein einziges Pixel an. Screenshots desselben Bildschirms während der Aufnahme
-//! kommen aus diesem Bild (`RecorderTap`), ohne zweite Aufnahme.
+//! Die CPU fasst dabei kein einziges Pixel an. Der Mauszeiger kommt im selben Schritt als zweiter
+//! Eingang des Video-Prozessors dazu (abschaltbar, auch während der Aufnahme). Screenshots desselben
+//! Bildschirms während der Aufnahme kommen aus diesem Bild (`RecorderTap`, ohne Zeiger: Screenshots
+//! zeichnen ihn nach eigener Einstellung), ohne zweite Aufnahme.
 //!
 //! Ton läuft in einem eigenen Thread (`audio.rs`) auf derselben Uhr: Beide zählen ab demselben
 //! QPC-Ursprung. Beim Speichern kommen die Tonpakete dazu, die genau die Zeit des Videos abdecken.
@@ -16,7 +18,8 @@
 use crate::audio::{AudioRecorder, Clock, qpc_now, qpc_to_ticks};
 use crate::duplication::FrameTap;
 use crate::encode::{HardwareEncoder, hardware_available};
-use crate::video::{Converter, Gpu, ScreenGrabber, find_output};
+use crate::smartstart;
+use crate::video::{Converter, Gpu, ScreenGrabber, adapter_by_luid, find_output};
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -24,8 +27,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use veloframe_core::audio::{AudioSetRequest, AudioStatus, aac_lc_config, clip_range};
-use veloframe_core::clip::{self, BufferRequest, BufferStatus, ClipResult, EncoderPlan, SaveClipRequest, Storage, VideoCodec};
-use veloframe_core::mp4::{AudioTrack, Packet, TICKS_PER_SECOND, VideoTrack, write_mp4};
+use veloframe_core::clip::{self, BufferRequest, BufferStatus, ClipResult, ClipStart, CursorSetRequest, EncoderPlan, SaveClipRequest, Storage, VideoCodec};
+use veloframe_core::mp4::{AudioTrack, Packet, PacketInfo, TICKS_PER_SECOND, VideoTrack, write_mp4};
 use veloframe_core::replay::{FileStore, RamStore, ReplayBuffer, Store};
 use veloframe_core::screenshot::create_unique_file;
 use veloframe_core::frame::{BgraView, Rotation};
@@ -74,7 +77,13 @@ pub struct Recorder {
     thread: Option<JoinHandle<()>>,
     plan: EncoderPlan,
     screen: Rect,
+    /// Grafikkarte der Aufnahme (dort wird auch der bildgenaue Anfang neu kodiert).
+    luid: u64,
     frames: mpsc::Sender<FrameRequest>,
+    /// GPU und Encoder für den bildgenauen Anfang, nach dem ersten Clip bereitgehalten.
+    smart_start: Mutex<Option<smartstart::SmartStart>>,
+    /// Mauszeiger ins Video zeichnen (gilt ab dem nächsten Bild).
+    cursor: Arc<AtomicBool>,
     audio: Option<AudioRecorder>,
     /// Warum der Ton nicht läuft, obwohl er geplant war (das Video läuft trotzdem).
     audio_error: Option<String>,
@@ -101,7 +110,7 @@ fn setup(request: &BufferRequest) -> Result<(Pipeline, EncoderPlan, ReplayBuffer
     let gpu = Gpu::new(&adapter, plan.low_gpu_priority)?;
     let grabber = ScreenGrabber::new(output, rect, &gpu)?;
     let encoder = HardwareEncoder::create(&gpu.device, gpu.luid, &plan)?;
-    let converter = Converter::new(&gpu, (grabber.width, grabber.height), (plan.width, plan.height), plan.fps)?;
+    let converter = Converter::new(&gpu, (grabber.width, grabber.height), grabber.rotation, (plan.width, plan.height), plan.fps)?;
     let store: Box<dyn Store> = match plan.storage {
         Storage::File => Box::new(
             FileStore::create(&std::env::temp_dir(), plan.buffer_capacity())
@@ -113,15 +122,29 @@ fn setup(request: &BufferRequest) -> Result<(Pipeline, EncoderPlan, ReplayBuffer
     Ok((Pipeline { gpu, grabber, converter, encoder }, plan, buffer, rect))
 }
 
-/// Kopiert `region` (relativ zum Bildschirm) aus dem aktuellen GPU-Bild und liest es als RGB.
-/// Nur dieser Ausschnitt wandert zur CPU; die Kopie dafür wird danach wieder freigegeben.
-fn read_region(gpu: &Gpu, latest: &ID3D11Texture2D, region: Rect, out: &mut RgbImage) -> Result<()> {
+/// Wo `region` (Desktop-Koordinaten relativ zum Bildschirm) in einem gedrehten Bild liegt.
+fn image_box(region: Rect, screen: (usize, usize), rotation: Rotation) -> Rect {
+    let corners = [(region.x, region.y), (region.right() - 1, region.bottom() - 1)]
+        .map(|(x, y)| rotation.image_position(x as usize, y as usize, screen.0, screen.1));
+    let (x0, x1) = (corners[0].0.min(corners[1].0), corners[0].0.max(corners[1].0));
+    let (y0, y1) = (corners[0].1.min(corners[1].1), corners[0].1.max(corners[1].1));
+    Rect::new(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32)
+}
+
+/// Kopiert `region` (relativ zum Bildschirm, `screen` groß wie der Desktop ihn zeigt) aus dem
+/// aktuellen GPU-Bild und liest es als RGB, aufrecht gedreht. Nur dieser Ausschnitt wandert zur CPU;
+/// die Kopie dafür wird danach wieder freigegeben.
+fn read_region(gpu: &Gpu, latest: &ID3D11Texture2D, region: Rect, screen: (usize, usize), rotation: Rotation, out: &mut RgbImage) -> Result<()> {
     let failed = |e: windows::core::Error| Error::Capture(format!("Bild aus dem Clip-Puffer: {e}"));
+    let source = image_box(region, screen, rotation);
     unsafe {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         latest.GetDesc(&mut desc);
-        desc.Width = region.width as u32;
-        desc.Height = region.height as u32;
+        if source.right() as u32 > desc.Width || source.bottom() as u32 > desc.Height {
+            return Err(Error::CaptureLost("Das Bild passt nicht zur Größe des Bildschirms.".into()));
+        }
+        desc.Width = source.width as u32;
+        desc.Height = source.height as u32;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -130,11 +153,11 @@ fn read_region(gpu: &Gpu, latest: &ID3D11Texture2D, region: Rect, out: &mut RgbI
         gpu.device.CreateTexture2D(&desc, None, Some(&mut staging)).map_err(failed)?;
         let staging = staging.unwrap();
         let area = D3D11_BOX {
-            left: region.x as u32,
-            top: region.y as u32,
+            left: source.x as u32,
+            top: source.y as u32,
             front: 0,
-            right: region.right() as u32,
-            bottom: region.bottom() as u32,
+            right: source.right() as u32,
+            bottom: source.bottom() as u32,
             back: 1,
         };
         gpu.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, latest, 0, Some(&area));
@@ -143,8 +166,8 @@ fn read_region(gpu: &Gpu, latest: &ID3D11Texture2D, region: Rect, out: &mut RgbI
         let (width, height) = (region.width as usize, region.height as usize);
         let pitch = mapped.RowPitch as usize;
         // SAFETY: Map liefert mindestens pitch × (Höhe − 1) + Breite × 4 lesbare Bytes bis Unmap.
-        let pixels = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (height - 1) + width * 4);
-        BgraView { pixels, pitch, width, height, rotation: Rotation::Identity }.crop_to_rgb(Rect::new(0, 0, region.width, region.height), out);
+        let pixels = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (source.height as usize - 1) + source.width as usize * 4);
+        BgraView { pixels, pitch, width, height, rotation }.crop_to_rgb(Rect::new(0, 0, region.width, region.height), out);
         gpu.context.Unmap(&staging, 0);
     }
     Ok(())
@@ -220,7 +243,17 @@ fn feed(encoder: &mut HardwareEncoder, pending: &mut VecDeque<(windows::Win32::M
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<FrameRequest>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shared>>, origin: i64, lag: Arc<AtomicI64>) {
+fn run(
+    mut p: Pipeline,
+    plan: EncoderPlan,
+    screen: Rect,
+    frames: mpsc::Receiver<FrameRequest>,
+    stop: Arc<AtomicBool>,
+    cursor: Arc<AtomicBool>,
+    shared: Arc<Mutex<Shared>>,
+    origin: i64,
+    lag: Arc<AtomicI64>,
+) {
     let _timer = TimerResolution::begin();
     let _mmcss = MmcssCapture::join();
     let period = Duration::from_secs_f64(1.0 / plan.fps as f64);
@@ -279,11 +312,22 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
                     lag_samples += 1;
                 }
             }
+            // Auflösung oder Drehung hat sich geändert (Desktop Duplication neu geöffnet): Umrechnung
+            // neu einrichten. Das Video behält seine Größe, der neue Inhalt wird hineinskaliert.
+            if p.grabber.latest.is_some() && ((p.grabber.width, p.grabber.height) != p.converter.input_size || p.grabber.rotation != p.converter.rotation) {
+                p.converter = Converter::new(&p.gpu, (p.grabber.width, p.grabber.height), p.grabber.rotation, (plan.width, plan.height), plan.fps)?;
+            }
             // Screenshot-Wünsche bedienen, bevor das Bild weiterläuft.
+            let desktop = p.grabber.rotation.image_size(p.grabber.width as usize, p.grabber.height as usize);
             while let Ok(request) = frames.try_recv() {
                 let FrameRequest { region, mut image, reply } = request;
                 let answer = match (&p.grabber.latest, region.intersect(&screen)) {
-                    (Some(latest), Some(part)) => read_region(&p.gpu, latest, part.relative_to(&screen), &mut image).map(|()| image),
+                    (Some(_), Some(_)) if desktop != (screen.width as usize, screen.height as usize) => {
+                        Err(Error::CaptureLost("Der Bildschirm hat seine Größe geändert.".into()))
+                    }
+                    (Some(latest), Some(part)) => {
+                        read_region(&p.gpu, latest, part.relative_to(&screen), desktop, p.grabber.rotation, &mut image).map(|()| image)
+                    }
                     (None, _) => Err(Error::Capture("Der Clip-Puffer hat noch kein Bild.".into())),
                     (_, None) => Err(Error::NoScreen("Der Bereich liegt nicht auf dem aufgenommenen Bildschirm.".into())),
                 };
@@ -293,7 +337,8 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
             // Pünktlich umrechnen und einreihen; abgeholt wird, sobald der Encoder bereit ist.
             match p.encoder.free_frame()? {
                 Some((sample, texture, slice)) => {
-                    p.converter.convert(&latest, &texture, slice)?;
+                    let pointer = cursor.load(Ordering::Relaxed).then_some(&p.grabber.pointer);
+                    p.converter.convert(&latest, &texture, slice, pointer)?;
                     let time = pts(frame, plan.fps);
                     pending.push_back((sample, offset + time, pts(frame + 1, plan.fps) - time));
                     if pending.len() > MAX_PENDING {
@@ -360,6 +405,7 @@ fn run(mut p: Pipeline, plan: EncoderPlan, screen: Rect, frames: mpsc::Receiver<
             shared.status.dropped_encoder_busy = busy;
             shared.status.dropped_pool_full = pool_full;
             shared.status.dropped_late = late;
+            shared.status.cursor_error = p.converter.cursor_error.clone();
             if error.is_some() {
                 shared.status.error = error.take();
             }
@@ -383,12 +429,13 @@ impl Recorder {
         // Bis gemessen ist, wie alt ein Bild beim Abholen ist: eine halbe Bilddauer.
         let lag = Arc::new(AtomicI64::new(TICKS_PER_SECOND / (2 * request.fps.max(1) as i64)));
         let stop = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(AtomicBool::new(request.cursor));
         let shared = Arc::new(Mutex::new(Shared { buffer: None, status: BufferStatus::default() }));
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(EncoderPlan, Rect)>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(EncoderPlan, Rect, u64)>>();
         let (frames_tx, frames_rx) = mpsc::channel::<FrameRequest>();
         let request = request.clone();
         let thread = {
-            let (stop, shared, lag) = (stop.clone(), shared.clone(), lag.clone());
+            let (stop, cursor, shared, lag) = (stop.clone(), cursor.clone(), shared.clone(), lag.clone());
             std::thread::Builder::new()
                 .name("veloframe-video".into())
                 .spawn(move || match setup(&request) {
@@ -401,11 +448,12 @@ impl Recorder {
                                 plan: Some(plan.clone()),
                                 encoder: Some(pipeline.encoder.name.clone()),
                                 applied: pipeline.encoder.applied.clone(),
+                                cursor_error: pipeline.converter.cursor_error.clone(),
                                 ..Default::default()
                             };
                         }
-                        let _ = ready_tx.send(Ok((plan.clone(), screen)));
-                        run(pipeline, plan, screen, frames_rx, stop, shared, origin, lag);
+                        let _ = ready_tx.send(Ok((plan.clone(), screen, pipeline.gpu.luid)));
+                        run(pipeline, plan, screen, frames_rx, stop, cursor, shared, origin, lag);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -413,7 +461,7 @@ impl Recorder {
                 })
                 .map_err(|e| Error::Capture(format!("Aufnahme-Thread: {e}")))?
         };
-        let (plan, screen) = ready_rx.recv().map_err(|_| Error::Capture("Aufnahme-Thread ist beim Start abgestürzt.".into()))??;
+        let (plan, screen, luid) = ready_rx.recv().map_err(|_| Error::Capture("Aufnahme-Thread ist beim Start abgestürzt.".into()))??;
         // Ton: Fehlt er (z. B. kein AAC-Encoder unter Windows N), läuft das Video trotzdem.
         let (audio, audio_error) = match &plan.audio {
             Some(audio_plan) => {
@@ -426,7 +474,15 @@ impl Recorder {
             }
             None => (None, None),
         };
-        Ok(Self { stop, shared, thread: Some(thread), plan, screen, frames: frames_tx, audio, audio_error })
+        Ok(Self { stop, shared, thread: Some(thread), plan, screen, luid, frames: frames_tx, smart_start: Mutex::new(None), cursor, audio, audio_error })
+    }
+
+    /// Mauszeiger im Video ein- oder ausschalten, während der Puffer läuft (ab dem nächsten Bild).
+    /// Kostet nichts: Encoder und Puffer laufen weiter, nur der zweite Eingang des Video-Prozessors
+    /// wird zu- oder abgeschaltet.
+    pub fn set_cursor(&self, request: &CursorSetRequest) -> BufferStatus {
+        self.cursor.store(request.visible, Ordering::Relaxed);
+        self.status()
     }
 
     /// Lautstärke oder Stummschaltung des Tons ändern, während der Puffer läuft.
@@ -444,6 +500,7 @@ impl Recorder {
     pub fn status(&self) -> BufferStatus {
         let mut status = self.shared.lock().unwrap().status.clone();
         status.running = self.thread.as_ref().is_some_and(|t| !t.is_finished());
+        status.cursor = self.cursor.load(Ordering::Relaxed);
         status.audio = match (&self.audio, &self.audio_error) {
             (Some(audio), _) => Some(audio.status()),
             (None, Some(error)) => Some(AudioStatus { error: Some(error.clone()), ..Default::default() }),
@@ -452,21 +509,85 @@ impl Recorder {
         status
     }
 
+    /// Kodiert den Anfang neu: Bilder mit Anzeigezeit in `start..end` aus den Paketen `0..until` des
+    /// Schnappschusses (Keyframe bis vor den nächsten Keyframe).
+    fn reencode_lead(&self, snapshot: &veloframe_core::replay::Snapshot, until: usize, start: i64, end: i64) -> Result<smartstart::Lead> {
+        let mut gop = Vec::with_capacity(until);
+        for i in 0..until {
+            let mut data = Vec::new();
+            snapshot.packets.packet(i, &mut data).map_err(|e| Error::Save(e.to_string()))?;
+            gop.push((data, snapshot.packets.infos[i]));
+        }
+        let mut smart = self.smart_start.lock().unwrap();
+        if smart.is_none() {
+            *smart = Some(smartstart::SmartStart::new(Gpu::new(&adapter_by_luid(self.luid)?, false)?, &self.plan));
+        }
+        smart.as_mut().unwrap().reencode(&snapshot.sets, &gop, start, end)
+    }
+
     /// Schreibt den Puffer (oder die letzten `seconds`) als MP4. Die Aufnahme läuft dabei weiter:
     /// Gesperrt wird nur für den Schnappschuss des Inhaltsverzeichnisses.
+    ///
+    /// Der Clip beginnt genau zur gewünschten Zeit (auf das Bild genau): Der Anfang bis zum nächsten
+    /// Keyframe wird neu kodiert, der Rest unverändert kopiert. Fehlt Windows ein Decoder für den
+    /// Codec, setzt stattdessen die Bearbeitungsliste den Anfang (kein Player mit Media Foundation
+    /// kann den Clip dann abspielen, alle anderen wenden sie richtig an).
     pub fn save(&self, request: &SaveClipRequest, desktop: &impl Desktop) -> Result<ClipResult> {
         let start = Instant::now();
         if !request.folder.is_absolute() {
             return Err(Error::InvalidRequest("Der Speicherort muss ein vollständiger Pfad sein.".into()));
         }
+        // Ohne Angabe: so lang wie der Puffer eingestellt ist (er hält bis zu einen GOP mehr).
+        let seconds = request.seconds.unwrap_or(self.plan.seconds);
         let snapshot = {
             let guard = self.shared.lock().unwrap();
             let buffer = guard.buffer.as_ref().ok_or_else(|| Error::InvalidRequest("Der Clip-Puffer läuft nicht.".into()))?;
-            buffer.snapshot(request.seconds).map_err(|e| Error::Save(e.to_string()))?
+            buffer.snapshot(Some(seconds)).map_err(|e| Error::Save(e.to_string()))?
         };
-        let infos = &snapshot.packets.infos;
-        let video_start = infos.iter().map(|i| i.pts).min().unwrap_or(0);
-        let video_end = infos.iter().map(|i| i.pts + i.duration).max().unwrap_or(0);
+        let all = &snapshot.packets.infos;
+        let video_end = all.iter().map(|i| i.pts + i.duration).max().unwrap_or(0);
+        let keyframe_start = all.iter().map(|i| i.pts).min().unwrap_or(0);
+        let requested = video_end - seconds as i64 * TICKS_PER_SECOND;
+        // Erstes Bild (in Anzeigereihenfolge) ab der gewünschten Zeit.
+        let first_shown = all.iter().map(|i| i.pts).filter(|&p| p >= requested).min().unwrap_or(keyframe_start);
+
+        let mut lead: Option<(smartstart::Lead, usize)> = None;
+        let mut skip = 0;
+        let mut method = ClipStart::Keyframe;
+        let mut lead_ms = 0.0;
+        if first_shown > keyframe_start {
+            let until = all.iter().skip(1).position(|i| i.key).map_or(all.len(), |p| p + 1);
+            let lead_end = all[until..].iter().map(|i| i.pts).min().unwrap_or(video_end);
+            if smartstart::decoder_available(snapshot.codec) {
+                let begun = Instant::now();
+                // Klappt das Neu-Kodieren nicht, beginnt der Clip am Keyframe (wie bisher).
+                if let Ok(mut reencoded) = self.reencode_lead(&snapshot, until, first_shown, lead_end) {
+                    // Dekodierzeiten vor den kopierten Teil legen: Das letzte neue Bild wird vor dem
+                    // nächsten Keyframe dekodiert, auch wenn dessen Dekodierzeit vor seiner Anzeige liegt.
+                    if let Some(next) = all.get(until) {
+                        let frame = next.duration.max(1);
+                        let last = reencoded.packets.iter().map(|(_, i)| i.dts).max().unwrap_or(0);
+                        let shift = (last + frame - next.dts).max(0);
+                        for (_, info) in &mut reencoded.packets {
+                            info.dts -= shift;
+                        }
+                    }
+                    lead = Some((reencoded, until));
+                    method = ClipStart::Reencoded;
+                }
+                lead_ms = begun.elapsed().as_secs_f64() * 1000.0;
+            } else {
+                skip = first_shown - keyframe_start;
+                method = ClipStart::EditList;
+            }
+        }
+        // Pakete des Clips: neu kodierter Anfang, dann ab dem nächsten Keyframe unverändert.
+        let (infos, copied_from): (Vec<PacketInfo>, usize) = match &lead {
+            Some((reencoded, until)) => (reencoded.packets.iter().map(|(_, i)| *i).chain(all[*until..].iter().copied()).collect(), *until),
+            None => (all.clone(), 0),
+        };
+        let lead_count = lead.as_ref().map_or(0, |(r, _)| r.packets.len());
+        let video_start = if method == ClipStart::Keyframe { keyframe_start } else { first_shown };
         // Ton: Der Mischer läuft bewusst etwas hinter der Echtzeit (60 ms + 2 Frames im Encoder).
         // Kurz warten, bis er das Ende des Videos erreicht hat, damit der Clip bis zum Schluss Ton
         // hat (höchstens 250 ms). Dann eine Kopie der (kleinen) Tonpuffer.
@@ -503,9 +624,24 @@ impl Recorder {
         let (path, file) = create_unique_file(&request.folder, "Clip", &desktop.timestamp(), "mp4")?;
         let written = (|| -> std::io::Result<veloframe_core::mp4::Mp4Info> {
             let mut out = BufWriter::with_capacity(1 << 20, file);
-            let video = VideoTrack { codec: snapshot.codec, width: self.plan.width, height: self.plan.height, sets: &snapshot.sets, infos };
+            // Eigene Sample-Beschreibung für den neuen Anfang nur, wenn seine Parametersätze abweichen.
+            let lead_sets = lead.as_ref().map(|(r, _)| &r.sets).filter(|sets| **sets != snapshot.sets).map(|sets| (sets, lead_count));
+            let video = VideoTrack {
+                codec: snapshot.codec,
+                width: self.plan.width,
+                height: self.plan.height,
+                sets: &snapshot.sets,
+                infos: &infos,
+                lead: lead_sets,
+                skip,
+            };
             let info = write_mp4(&mut out, &video, &tracks, |p, buf| match p {
-                Packet::Video(i) => snapshot.packets.packet(i, buf),
+                Packet::Video(i) if i < lead_count => {
+                    buf.clear();
+                    buf.extend_from_slice(&lead.as_ref().unwrap().0.packets[i].0);
+                    Ok(())
+                }
+                Packet::Video(i) => snapshot.packets.packet(copied_from + i - lead_count, buf),
                 Packet::Audio { track, index } => audio[track].packet(ranges[track].start + index, buf),
             })?;
             out.flush()?;
@@ -534,6 +670,9 @@ impl Recorder {
             save_ms: start.elapsed().as_secs_f64() * 1000.0,
             audio_tracks: self.audio.as_ref().map(|a| a.plan.tracks[..info.audio_tracks].to_vec()).unwrap_or_default(),
             audio_seconds: info.audio_seconds,
+            start_offset_ms: (video_start - requested) as f64 / 1e4,
+            start: method,
+            start_encode_ms: lead_ms,
         })
     }
 
@@ -542,6 +681,7 @@ impl Recorder {
     }
 
     fn shutdown(&mut self) {
+        self.smart_start.lock().unwrap().take();
         self.audio = None;
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -554,5 +694,22 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regions_of_rotated_screens_map_into_the_image() {
+        // Hochformat 1080 × 1920 (Desktop), geliefert quer als 1920 × 1080.
+        let screen = (1080, 1920);
+        let region = Rect::new(100, 200, 300, 400);
+        assert_eq!(image_box(region, screen, Rotation::Identity), region);
+        // Rotate90: Desktop (x, y) liegt im Bild bei (y, Breite − 1 − x).
+        assert_eq!(image_box(region, screen, Rotation::Rotate90), Rect::new(200, 1080 - 400, 400, 300));
+        assert_eq!(image_box(region, screen, Rotation::Rotate270), Rect::new(1920 - 600, 100, 400, 300));
+        assert_eq!(image_box(region, (1920, 1080), Rotation::Rotate180), Rect::new(1920 - 400, 1080 - 600, 300, 400));
     }
 }

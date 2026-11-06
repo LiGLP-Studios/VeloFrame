@@ -100,6 +100,13 @@ pub struct BufferRequest {
     /// `{"system": "off"}` nimmt ohne Ton auf.
     #[serde(default)]
     pub audio: AudioRequest,
+    /// Mauszeiger ins Video zeichnen. Lässt sich während der Aufnahme umschalten (`cursor-set`).
+    #[serde(default = "default_cursor")]
+    pub cursor: bool,
+}
+
+fn default_cursor() -> bool {
+    true
 }
 
 fn default_seconds() -> u32 {
@@ -256,8 +263,20 @@ pub struct BufferStatus {
     /// Wie oft der Regler den Aufwand angepasst hat.
     pub effort_changes: u32,
     pub error: Option<String>,
+    /// Ob der Mauszeiger gerade ins Video gezeichnet wird (eingeschaltet; ein ausgeblendeter Zeiger,
+    /// z. B. in Spielen, erscheint trotzdem nicht).
+    pub cursor: bool,
+    /// Warum der Zeiger nicht gezeichnet werden kann (z. B. Video-Prozessor ohne zweiten Eingang).
+    pub cursor_error: Option<String>,
     /// Ton-Aufnahme: Quellen, Pegel, Aussetzer, Drift, Warnungen.
     pub audio: Option<AudioStatus>,
+}
+
+/// Anfrage, den Mauszeiger im laufenden Puffer ein- oder auszuschalten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorSetRequest {
+    pub visible: bool,
 }
 
 /// Anfrage, einen Clip zu speichern.
@@ -287,6 +306,27 @@ pub struct ClipResult {
     pub audio_tracks: Vec<TrackKind>,
     /// Länge des Tons in Sekunden.
     pub audio_seconds: f64,
+    /// Wie weit der tatsächliche Anfang von der gewünschten Zeit liegt (ms). Normalerweise 0 bis unter
+    /// eine Bilddauer; negativ, wenn der Clip am Keyframe davor beginnen musste.
+    pub start_offset_ms: f64,
+    /// Wie der Anfang gesetzt wurde.
+    pub start: ClipStart,
+    /// Zeit für das Neu-Kodieren des Anfangs (ms, in `save_ms` enthalten).
+    pub start_encode_ms: f64,
+}
+
+/// Wie ein Clip zu seinem Anfang kommt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClipStart {
+    /// Die gewünschte Zeit fällt auf einen Keyframe, oder Neu-Kodieren ging nicht: Beginn am Keyframe.
+    #[default]
+    Keyframe,
+    /// Anfang bis zum nächsten Keyframe neu kodiert: bildgenau in jedem Player.
+    Reencoded,
+    /// Bearbeitungsliste setzt den Anfang (kein Decoder für den Codec in Windows, der Windows-Player
+    /// kann den Clip ohnehin nicht abspielen; alle anderen beginnen bildgenau).
+    EditList,
 }
 
 #[cfg(test)]
@@ -304,6 +344,7 @@ mod tests {
             storage: None,
             screen: Rect::new(0, 0, 1920, 1080),
             audio: AudioRequest::default(),
+            cursor: true,
         }
     }
 
@@ -352,7 +393,11 @@ mod tests {
         .unwrap();
         assert_eq!((r.mode, r.seconds, r.resolution, r.codec), (ClipMode::Long, 120, Resolution::P1080, Some(VideoCodec::Hevc)));
         let minimal: BufferRequest = serde_json::from_str(r#"{"screen":{"x":0,"y":0,"width":1920,"height":1080}}"#).unwrap();
-        assert_eq!((minimal.mode, minimal.seconds, minimal.fps), (ClipMode::Performance, 30, 60));
+        assert_eq!((minimal.mode, minimal.seconds, minimal.fps, minimal.cursor), (ClipMode::Performance, 30, 60, true));
+        let hidden: BufferRequest = serde_json::from_str(r#"{"cursor":false,"screen":{"x":0,"y":0,"width":1920,"height":1080}}"#).unwrap();
+        assert!(!hidden.cursor);
+        let set: CursorSetRequest = serde_json::from_str(r#"{"visible":false}"#).unwrap();
+        assert!(!set.visible);
         let audio = plan(&minimal, true).unwrap().audio.unwrap();
         assert_eq!((audio.system, audio.tracks.len(), audio.bitrate), (crate::audio::SystemAudio::AllExceptHost, 1, 128_000));
         let silent: BufferRequest = serde_json::from_str(r#"{"audio":{"system":"off"},"screen":{"x":0,"y":0,"width":1920,"height":1080}}"#).unwrap();

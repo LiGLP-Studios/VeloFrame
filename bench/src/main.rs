@@ -7,6 +7,11 @@
 //! veloframe-bench clip [modus] [sek] [laufzeit] [codec] [ton]   Clip-Puffer messen (RAM, CPU, Bitrate), Clip speichern und prüfen
 //! veloframe-bench audio                  Tongeräte auflisten
 //! veloframe-bench sync [anzahl]          Sync-Test: Blitz + Klick aufnehmen, Versatz im gespeicherten Clip messen
+//! veloframe-bench cursor [auflösung]     Mauszeiger im Video: Hotspot, Umschalten, CPU (bewegt die Maus kurz)
+//! veloframe-bench mic [default|<id>] [both|separate]   Mikrofon: Spuren, Stummschalten, Pegel im Clip
+//! veloframe-bench start [performance|long] [h264|hevc]   bildgenauer Clip-Anfang: Länge, Art, Speicherzeit
+//! veloframe-bench robust [anzahl]        Start/Stopp mit Ton (Handles, Speicher), dann ohne AAC-Encoder
+//! veloframe-bench devices [sekunden]     Gerätewechsel live (Headset ab-/anstecken, Standardgerät umstellen)
 //! ```
 //!
 //! Immer im Release-Build messen: `cargo run --release -p veloframe-bench -- ...`
@@ -240,8 +245,16 @@ fn process_cpu_seconds() -> f64 {
     (k + u) as f64 / 1e7
 }
 
-/// Hauptbildschirm laut Systemprüfung.
+/// Hauptbildschirm laut Systemprüfung. `VELOFRAME_BENCH_SCREEN=x,y,breite,höhe` wählt einen anderen
+/// (z. B. den Bildschirm an einer zweiten Grafikkarte, um deren Encoder zu messen).
 fn main_screen(engine: &Engine) -> Result<Rect, String> {
+    if let Ok(value) = std::env::var("VELOFRAME_BENCH_SCREEN") {
+        let n: Vec<i32> = value.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if let [x, y, w, h] = n[..] {
+            return Ok(Rect::new(x, y, w, h));
+        }
+        return Err("VELOFRAME_BENCH_SCREEN erwartet x,y,breite,höhe.".into());
+    }
     let report = engine.system_check().map_err(|e| e.to_string())?;
     let main = report["adapters"]
         .as_array()
@@ -302,7 +315,8 @@ fn clip(mode: veloframe::ClipMode, seconds: u32, run_for: u32, codec: Option<vel
     let mut engine = Engine::new().map_err(|e| e.to_string())?;
     println!("Vor dem Start: Task-Manager {:.1} MB", mb(private_working_set() as f64));
     let screen = main_screen(&engine)?;
-    let request = BufferRequest { mode, seconds, fps: 60, quality: Quality::High, resolution: Resolution::Native, codec, storage: None, screen, audio };
+    let cursor = std::env::var("VELOFRAME_BENCH_CURSOR").map_or(true, |v| v != "off");
+    let request = BufferRequest { mode, seconds, fps: 60, quality: Quality::High, resolution: Resolution::Native, codec, storage: None, screen, audio, cursor };
     let started = Instant::now();
     let status = engine.start_buffer(&request).map_err(|e| e.to_string())?;
     let plan = status.plan.clone().ok_or("kein Plan")?;
@@ -379,6 +393,7 @@ fn clip(mode: veloframe::ClipMode, seconds: u32, run_for: u32, codec: Option<vel
         clip.width,
         clip.height
     );
+    println!("Anfang: {:?}, {:+.1} ms neben der gewünschten Zeit, Neu-Kodieren {:.0} ms", clip.start, clip.start_offset_ms, clip.start_encode_ms);
     match veloframe_win::verify::check_video(std::path::Path::new(&clip.path), clip.frames) {
         Ok(check) => {
             println!("Windows-Decoder: {} Bilder, {:.2} s, {}×{} → abspielbar", check.frames, check.duration_seconds, check.width, check.height);
@@ -419,12 +434,19 @@ fn check_file(path: &str) -> Result<(), String> {
     veloframe_win::init_process();
     let path = std::path::Path::new(path);
     match veloframe_win::verify::check_video(path, 0) {
-        Ok(v) => println!("Bild: {} Bilder, {:.3} s, {}×{}", v.frames, v.duration_seconds, v.width, v.height),
+        Ok(v) => println!("Bild: {} Bilder, {:.3} s, {}×{}, erstes Bild bei {:.2} ms", v.frames, v.duration_seconds, v.width, v.height, v.first_time as f64 / 1e4),
         Err(e) => println!("Bild: {e}"),
     }
     match veloframe_win::verify::check_audio(path).map_err(|e| e.to_string())? {
         Some(a) => println!("Ton: {:.3} s, erstes Sample bei {:.2} ms, Pegel {:.2}", a.seconds(), a.first_time as f64 / 1e4, a.peak()),
         None => println!("Ton: keiner"),
+    }
+    let tracks = veloframe_win::verify::check_audio_tracks(path).map_err(|e| e.to_string())?;
+    if tracks.len() > 1 {
+        for (n, t) in tracks.iter().enumerate() {
+            let levels: Vec<String> = t.rms_db(0.5).iter().map(|db| format!("{db:>4.0}")).collect();
+            println!("  Tonstrom {} ({}{}): {:.2} s, Pegel je 0,5 s: {}", n + 1, t.stream, if t.selected { ", spielt von sich aus" } else { "" }, t.seconds(), levels.join(" "));
+        }
     }
     if let Some((empty, media)) = audio_edit(&std::fs::read(path).map_err(|e| e.to_string())?) {
         println!("Bearbeitungsliste Ton: {empty} ms leer, ab Sample {media}");
@@ -456,7 +478,9 @@ fn audio_edit(file: &[u8]) -> Option<(i64, i64)> {
         children(data).into_iter().find(|(k, _)| k == kind).map(|(_, d)| d)
     }
     let moov = child(file, b"moov")?;
-    let trak = children(moov).into_iter().filter(|(k, _)| k == b"trak").map(|(_, d)| d).nth(1)?;
+    // Die erste Tonspur steht als letzte `trak`-Box in der Datei (siehe mp4.rs).
+    let traks: Vec<&[u8]> = children(moov).into_iter().filter(|(k, _)| k == b"trak").map(|(_, d)| d).collect();
+    let trak = *traks.last().filter(|_| traks.len() > 1)?;
     let elst = child(child(trak, b"edts")?, b"elst")?;
     let entries = u32::from_be_bytes(elst[4..8].try_into().unwrap()) as usize;
     let at = |i: usize, o: usize| i64::from_be_bytes(elst[8 + i * 20 + o..8 + i * 20 + o + 8].try_into().unwrap());
@@ -474,28 +498,32 @@ fn audio_edit(file: &[u8]) -> Option<(i64, i64)> {
 /// Sync-Test: Ein Fenster blitzt auf und gleichzeitig spielt ein Klick, mehrmals. Danach wird der
 /// gespeicherte Clip dekodiert und gemessen, wie weit Klick und Blitz darin auseinanderliegen.
 #[cfg(windows)]
-fn sync(count: u32, only_self: bool, output: Option<String>) -> Result<(), String> {
-    use veloframe::{AudioRequest, BufferRequest, ClipMode, Quality, Resolution, SaveClipRequest, SystemAudio, VideoCodec};
+fn sync(count: u32, only_self: bool, output: Option<String>, mode: veloframe::ClipMode, codec: veloframe::VideoCodec) -> Result<(), String> {
+    use veloframe::{AudioRequest, BufferRequest, Quality, Resolution, SaveClipRequest, SystemAudio};
     use veloframe_win::audio::qpc_now;
     use veloframe_win::synctest::{Clicker, Flasher};
     let folder = std::env::temp_dir().join("veloframe-clips");
     let mut engine = Engine::new().map_err(|e| e.to_string())?;
     let screen = main_screen(&engine)?;
-    // H.264 ohne B-Frames: Die Bildzeiten sind dann eindeutig. Ton: alles (der Klick kommt von hier).
+    // Standard: Long + H.264 ohne B-Frames. `performance h264` prüft Clips mit B-Frames (Bearbeitungsliste
+    // und Zeitversätze der Videospur). Ton: alles (der Klick kommt von hier).
     let request = BufferRequest {
-        mode: ClipMode::Long,
-        seconds: count + 10,
+        mode,
+        seconds: (count + 10).max(5).min(mode.seconds_range().1),
         fps: 60,
         quality: Quality::Medium,
         resolution: Resolution::Native,
-        codec: Some(VideoCodec::H264),
+        codec: Some(codec),
         storage: None,
         screen,
         // `self`: nur der Ton dieses Programms (der Klick), unabhängig von Musik o. Ä. im Hintergrund.
         audio: AudioRequest { system: if only_self { SystemAudio::Process(std::process::id()) } else { SystemAudio::All }, ..Default::default() },
+        // Der Zeiger könnte über dem Blitz liegen und die Helligkeit verfälschen.
+        cursor: false,
     };
-    engine.start_buffer(&request).map_err(|e| e.to_string())?;
-    let area = Rect::new(screen.width / 2 - 240, screen.height / 2 - 135, 480, 270);
+    let started = engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    println!("{:?} {:?}, Encoder {}: {}", mode, codec, started.encoder.unwrap_or_default(), started.applied.join(", "));
+    let area = Rect::new(screen.x + screen.width / 2 - 240, screen.y + screen.height / 2 - 135, 480, 270);
     let flasher = Flasher::new(area).map_err(|e| e.to_string())?;
     let clicker = Clicker::new(0.3, output).map_err(|e| e.to_string())?;
     let wait = |ms: u64| {
@@ -542,10 +570,10 @@ fn sync(count: u32, only_self: bool, output: Option<String>) -> Result<(), Strin
     // Auswerten wie ein Player: Bild- und Tonzeiten aus dem Windows-Decoder, Bearbeitungsliste angewandt.
     let path = std::path::Path::new(&clip.path);
     let region = (
-        (area.x + 60) as f32 / screen.width as f32,
-        (area.y + 40) as f32 / screen.height as f32,
-        (area.right() - 60) as f32 / screen.width as f32,
-        (area.bottom() - 40) as f32 / screen.height as f32,
+        (area.x - screen.x + 60) as f32 / screen.width as f32,
+        (area.y - screen.y + 40) as f32 / screen.height as f32,
+        (area.right() - screen.x - 60) as f32 / screen.width as f32,
+        (area.bottom() - screen.y - 40) as f32 / screen.height as f32,
     );
     let frames = veloframe_win::verify::video_brightness(path, region).map_err(|e| e.to_string())?;
     let audio = veloframe_win::verify::check_audio(path).map_err(|e| e.to_string())?.ok_or("Der Clip hat keine Tonspur.")?;
@@ -603,6 +631,463 @@ fn sync(count: u32, only_self: bool, output: Option<String>) -> Result<(), Strin
         "Versatz im Clip (Ton − Bild, gegenüber der Wirklichkeit): Mittel {mean:+.1} ms, Spanne {min:+.1} … {max:+.1} ms ({} Paare). Ein Bild dauert 16,7 ms.",
         errors.len()
     );
+    Ok(())
+}
+
+/// Bewegt den Mauszeiger (für den Zeiger-Test). Gibt die vorige Position zurück.
+#[cfg(windows)]
+fn move_mouse(x: i32, y: i32) -> (i32, i32) {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    unsafe extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn SetCursorPos(x: i32, y: i32) -> i32;
+    }
+    let mut old = Point { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut old);
+        SetCursorPos(x, y);
+    }
+    (old.x, old.y)
+}
+
+/// Zeiger-Test: Ein Fenster (weiß, dann schwarz, dann weiß) liegt unter dem Mauszeiger, der Zeiger
+/// wird per `set_cursor` aus- und wieder eingeschaltet, dann wechselt die Form vom Fadenkreuz zum
+/// Pfeil. Im gespeicherten Clip wird gemessen: Lage des Hotspots, wann das Umschalten wirkt, und am
+/// Ende die CPU mit und ohne Zeiger bei bewegter Maus.
+#[cfg(windows)]
+fn cursor_test(resolution: veloframe::Resolution) -> Result<(), String> {
+    use veloframe::{AudioRequest, BufferRequest, ClipMode, Quality, SaveClipRequest, SystemAudio, VideoCodec};
+    use veloframe_win::synctest::Flasher;
+    let folder = std::env::temp_dir().join("veloframe-clips");
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let request = BufferRequest {
+        mode: ClipMode::Long,
+        seconds: 10,
+        fps: 60,
+        quality: Quality::High,
+        resolution,
+        codec: Some(VideoCodec::H264),
+        storage: None,
+        screen,
+        audio: AudioRequest { system: SystemAudio::Off, ..Default::default() },
+        cursor: true,
+    };
+    let status = engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    let plan = status.plan.clone().ok_or("kein Plan")?;
+    println!("Video {}×{} von {}×{}, Zeiger: {}", plan.width, plan.height, screen.width, screen.height, status.cursor_error.clone().unwrap_or_else(|| "möglich".into()));
+    let area = Rect::new(screen.x + screen.width / 2 - 240, screen.y + screen.height / 2 - 135, 480, 270);
+    let flasher = Flasher::new(area).map_err(|e| e.to_string())?;
+    // Ungerade Lage, damit Rundungsfehler beim Skalieren auffallen.
+    let target = (area.x + 237, area.y + 131);
+    let old = move_mouse(target.0, target.1);
+    flasher.set_cursor(true);
+    flasher.show(true);
+    let wait = |ms: u64| {
+        let until = Instant::now() + std::time::Duration::from_millis(ms);
+        while Instant::now() < until {
+            flasher.tick();
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+    };
+    wait(2500);
+    // Gleichzeitig schwarz werden und den Zeiger abschalten, eine Sekunde später umgekehrt.
+    flasher.show(false);
+    let off = engine.set_cursor(false).map_err(|e| e.to_string())?;
+    wait(1000);
+    flasher.show(true);
+    let on = engine.set_cursor(true).map_err(|e| e.to_string())?;
+    wait(1000);
+    flasher.set_cursor(false);
+    move_mouse(target.0 + 1, target.1);
+    move_mouse(target.0, target.1);
+    wait(1200);
+    println!("buffer-status.cursor nach cursor-set: aus → {}, an → {}", off.cursor, on.cursor);
+    let clip = engine.save_clip(&SaveClipRequest { folder, seconds: None }).map_err(|e| e.to_string())?;
+
+    // CPU: je 8 s mit Zeiger an und aus, die Maus kreist dabei (wie beim Arbeiten auf dem Desktop).
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    let mut cpu = Vec::new();
+    for visible in [true, false, true, false] {
+        engine.set_cursor(visible).map_err(|e| e.to_string())?;
+        let (cpu0, t0) = (process_cpu_seconds(), Instant::now());
+        let mut step = 0f64;
+        while t0.elapsed().as_secs_f64() < 8.0 {
+            step += 0.05;
+            move_mouse(target.0 + (step.cos() * 60.0) as i32, target.1 + (step.sin() * 60.0) as i32);
+            flasher.pump();
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        cpu.push((visible, (process_cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64() * 100.0 / cores));
+    }
+    move_mouse(old.0, old.1);
+    drop(flasher);
+    engine.stop_buffer();
+    println!("Clip: {} ({:.1} s)", clip.path, clip.duration_seconds);
+
+    // Auswerten: Ausschnitt um die erwartete Stelle, umgerechnet auf die Videogröße.
+    let scale = plan.width as f64 / screen.width as f64;
+    let expected = (((target.0 - screen.x) as f64 * scale), ((target.1 - screen.y) as f64 * scale));
+    let half = (48.0 * scale).ceil() as i32;
+    let crop = Rect::new(expected.0 as i32 - half, expected.1 as i32 - half, 2 * half, 2 * half);
+    let frames = veloframe_win::verify::video_crops(std::path::Path::new(&clip.path), crop).map_err(|e| e.to_string())?;
+    // Hintergrund aus dem Rand des Ausschnitts, Zeigerpixel heben sich davon ab.
+    let analyse = |gray: &[u8]| -> (bool, usize, Option<(i32, i32, i32, i32)>) {
+        let w = crop.width as usize;
+        let border: u32 = (0..w).map(|x| gray[x] as u32).sum::<u32>() / w as u32;
+        let white = border > 128;
+        let mut bbox: Option<(i32, i32, i32, i32)> = None;
+        let mut count = 0;
+        for (i, &g) in gray.iter().enumerate() {
+            let hit = if white { g < 100 } else { g > 155 };
+            if hit {
+                count += 1;
+                let (x, y) = ((i % w) as i32, (i / w) as i32);
+                bbox = Some(bbox.map_or((x, y, x, y), |(a, b, c, d)| (a.min(x), b.min(y), c.max(x), d.max(y))));
+            }
+        }
+        (white, count, bbox)
+    };
+    let rows: Vec<(f64, bool, usize, Option<(i32, i32, i32, i32)>)> =
+        frames.iter().map(|(t, g)| { let (w, c, b) = analyse(g); (*t as f64 / 1e4, w, c, b) }).collect();
+    let present = |c: usize| c > (8.0 * scale * scale) as usize;
+    // Fadenkreuz: Mitte der dunklen Pixel = Hotspot. Pfeil: Spitze (links oben) = Hotspot.
+    let to_screen = |v: i32, axis: f64| (crop.x as f64 * (1.0 - axis) + crop.y as f64 * axis + v as f64) / scale;
+    // Das Fenster ist anfangs kurz schwarz: erst die weiße Phase suchen, dann den Wechsel nach schwarz.
+    let first_white = rows.iter().position(|r| r.1).ok_or("Weiße Phase nicht gefunden.")?;
+    let first_black = first_white + rows[first_white..].iter().position(|r| !r.1).ok_or("Schwarze Phase nicht gefunden.")?;
+    let back_white = first_black + rows[first_black..].iter().position(|r| r.1).ok_or("Zweite weiße Phase nicht gefunden.")?;
+    let cross: Vec<_> = rows[..first_black].iter().rev().skip(5).take(30).filter_map(|r| r.3).collect();
+    let arrow: Vec<_> = rows[rows.len().saturating_sub(30)..].iter().filter_map(|r| r.3).collect();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    // Beide Zeiger als Bild (Ausschnitt, vergrößert) neben den Clip legen: Ränder und Durchsichtigkeit
+    // lassen sich so mit eigenen Augen prüfen.
+    for (name, index) in [("fadenkreuz", first_black.saturating_sub(10)), ("pfeil", frames.len() - 10)] {
+        let zoom = 4;
+        let mut image = RgbImage::default();
+        image.reset(crop.width as usize * zoom, crop.height as usize * zoom);
+        for (i, &g) in frames[index].1.iter().enumerate() {
+            let (x, y) = (i % crop.width as usize, i / crop.width as usize);
+            for dy in 0..zoom {
+                let row = (y * zoom + dy) * image.width;
+                for dx in 0..zoom {
+                    let at = (row + x * zoom + dx) * 3;
+                    image.data[at..at + 3].fill(g);
+                }
+            }
+        }
+        let mut png = Vec::new();
+        codec::png::encode(&image, &mut png).map_err(|e| e.to_string())?;
+        let file = std::path::Path::new(&clip.path).with_extension(format!("{name}.png"));
+        std::fs::write(&file, png).map_err(|e| e.to_string())?;
+        println!("Zeiger als Bild: {}", file.display());
+    }
+    if let (false, false) = (cross.is_empty(), arrow.is_empty()) {
+        let cx = mean(&cross.iter().map(|b| to_screen(b.0 + b.2, 0.0) / 2.0 + crop.x as f64 / scale / 2.0).collect::<Vec<_>>());
+        let cy = mean(&cross.iter().map(|b| to_screen(b.1 + b.3, 1.0) / 2.0 + crop.y as f64 / scale / 2.0).collect::<Vec<_>>());
+        let ax = mean(&arrow.iter().map(|b| to_screen(b.0, 0.0)).collect::<Vec<_>>());
+        let ay = mean(&arrow.iter().map(|b| to_screen(b.1, 1.0)).collect::<Vec<_>>());
+        let (tx, ty) = ((target.0 - screen.x) as f64, (target.1 - screen.y) as f64);
+        println!("Fadenkreuz: Mitte bei ({cx:.1}, {cy:.1}), Maus bei ({tx}, {ty}) → Abweichung ({:+.1}, {:+.1}) px", cx - tx, cy - ty);
+        println!("Pfeil: Spitze bei ({ax:.1}, {ay:.1}) → Abweichung ({:+.1}, {:+.1}) px", ax - tx, ay - ty);
+    } else {
+        println!("Zeiger im Video nicht gefunden (Fadenkreuz {} Bilder, Pfeil {} Bilder).", cross.len(), arrow.len());
+    }
+    // Umschalten: Bild und Zeiger wechseln im selben Moment; gezählt wird, wie viele Bilder danach der
+    // Zeiger noch (bzw. noch nicht) zu sehen ist.
+    let lag_off = rows[first_black..].iter().take_while(|r| present(r.2)).count();
+    let lag_on = rows[back_white..].iter().take_while(|r| !present(r.2)).count();
+    println!(
+        "Ausschalten: Zeiger noch {lag_off} Bild(er) nach dem Bildwechsel zu sehen; Einschalten: {lag_on} Bild(er) ohne Zeiger nach dem Bildwechsel (Bild bei {:.0} / {:.0} ms)",
+        rows[first_black].0, rows[back_white].0
+    );
+    let during_off = rows[first_black + 3..back_white.saturating_sub(1)].iter().filter(|r| present(r.2)).count();
+    println!("Während ausgeschaltet: {during_off} von {} Bildern mit Zeiger", back_white.saturating_sub(first_black + 4));
+    for (visible, c) in &cpu {
+        println!("CPU mit bewegter Maus, Zeiger {}: {c:.2} % der gesamten CPU", if *visible { "an " } else { "aus" });
+    }
+    let on: Vec<f64> = cpu.iter().filter(|c| c.0).map(|c| c.1).collect();
+    let off: Vec<f64> = cpu.iter().filter(|c| !c.0).map(|c| c.1).collect();
+    println!("Mehrkosten des Zeigers: {:+.3} % der gesamten CPU", mean(&on) - mean(&off));
+    Ok(())
+}
+
+/// Mikrofon-Test: System + Mikrofon (Standard oder Geräte-ID) in drei Spuren (`both`) oder je Quelle
+/// (`separate`). Erst das System (2–4 s), dann das Mikrofon (5–7 s) stummschalten (`audio-set`). Danach werden alle
+/// Tonspuren mit dem Windows-Decoder gelesen: Pegel je halbe Sekunde.
+#[cfg(windows)]
+fn mic_test(microphone: veloframe::Microphone, tracks: veloframe::TrackLayout) -> Result<(), String> {
+    use veloframe::{AudioRequest, AudioSetRequest, BufferRequest, ClipMode, Quality, Resolution, SaveClipRequest, SourceControl, SystemAudio};
+    let folder = std::env::temp_dir().join("veloframe-clips");
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let request = BufferRequest {
+        mode: ClipMode::Performance,
+        seconds: 15,
+        fps: 60,
+        quality: Quality::Medium,
+        resolution: Resolution::Native,
+        codec: None,
+        storage: None,
+        screen,
+        audio: AudioRequest { system: SystemAudio::All, microphone, tracks, ..Default::default() },
+        cursor: true,
+    };
+    let status = engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    if let Some(audio) = &status.audio {
+        println!("Spuren: {:?}, Encoder {}", audio.tracks, audio.encoder.clone().unwrap_or_else(|| audio.error.clone().unwrap_or_default()));
+    }
+    let mute = |muted: bool| AudioSetRequest { system: None, microphone: Some(SourceControl { gain: None, muted: Some(muted) }) };
+    let system = |muted: bool| AudioSetRequest { system: Some(SourceControl { gain: None, muted: Some(muted) }), microphone: None };
+    // System bei 2–4 s stumm, Mikrofon bei 5–7 s: so ist jede Spur an ihren Lücken zu erkennen.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    engine.set_audio(&system(true)).map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    engine.set_audio(&system(false)).map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let muted = engine.set_audio(&mute(true)).map_err(|e| e.to_string())?;
+    println!("Stumm: {:?}", muted.sources.iter().map(|s| (s.source, s.muted)).collect::<Vec<_>>());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    engine.set_audio(&mute(false)).map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let clip = engine.save_clip(&SaveClipRequest { folder, seconds: None }).map_err(|e| e.to_string())?;
+    if let Some(audio) = engine.buffer_status().audio {
+        print_audio(&audio);
+    }
+    engine.stop_buffer();
+    println!("Clip: {} ({:.1} s), Spuren laut Engine: {:?}", clip.path, clip.duration_seconds, clip.audio_tracks);
+    let decoded = veloframe_win::verify::check_audio_tracks(std::path::Path::new(&clip.path)).map_err(|e| e.to_string())?;
+    println!("Windows-Decoder findet {} Tonspur(en):", decoded.len());
+    for (n, track) in decoded.iter().enumerate() {
+        let levels: Vec<String> = track.rms_db(0.5).iter().map(|db| format!("{db:>4.0}")).collect();
+        println!(
+            "  Spur {} (Strom {}{}): {:.2} s, Pegel je 0,5 s (dBFS): {}",
+            n + 1,
+            track.stream,
+            if track.selected { ", spielt von sich aus" } else { "" },
+            track.seconds(),
+            levels.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// Offene Handles dieses Prozesses (Dateien, Threads, Ereignisse, GPU-Objekte …).
+#[cfg(windows)]
+fn handle_count() -> u32 {
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
+    }
+    let mut count = 0;
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    count
+}
+
+/// Robustheit: den Puffer `cycles`-mal mit Ton (System + Mikrofon) starten und stoppen, jeden zehnten
+/// Durchgang einen Clip speichern; Handles und Speicher vorher/nachher. Danach ohne AAC-Encoder (wie
+/// Windows N ohne Media Feature Pack): Das Video muss weiterlaufen, `audio.error` erklärt es.
+#[cfg(windows)]
+fn robust(cycles: u32) -> Result<(), String> {
+    use veloframe::{AudioRequest, BufferRequest, ClipMode, Microphone, Quality, Resolution, SaveClipRequest, SystemAudio, TrackLayout};
+    let mb = |b: usize| b as f64 / 1_048_576.0;
+    let folder = std::env::temp_dir().join("veloframe-clips");
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let request = |audio: AudioRequest| BufferRequest {
+        mode: ClipMode::Performance,
+        seconds: 5,
+        fps: 60,
+        quality: Quality::High,
+        resolution: Resolution::Native,
+        codec: Some(veloframe::VideoCodec::H264), // der Windows-Decoder prüft die Clips (HEVC braucht eine Store-Erweiterung)
+        storage: None,
+        screen,
+        audio,
+        cursor: true,
+    };
+    let with_audio = AudioRequest { system: SystemAudio::All, microphone: Microphone::Default, tracks: TrackLayout::Both, ..Default::default() };
+    // Ein Durchgang zum Aufwärmen: Media Foundation, Treiber und Encoder laden einmalig Bibliotheken.
+    engine.start_buffer(&request(with_audio.clone())).map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    engine.stop_buffer();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (handles0, ram0) = (handle_count(), private_working_set());
+    println!("Nach dem Aufwärmen: {handles0} Handles, Task-Manager {:.1} MB", mb(ram0));
+    let started = Instant::now();
+    let mut failures = 0;
+    for cycle in 1..=cycles {
+        let status = engine.start_buffer(&request(with_audio.clone())).map_err(|e| format!("Start {cycle}: {e}"))?;
+        if status.audio.as_ref().is_none_or(|a| a.error.is_some()) {
+            failures += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        if cycle % 10 == 0 {
+            let clip = engine.save_clip(&SaveClipRequest { folder: folder.clone(), seconds: None }).map_err(|e| format!("Speichern {cycle}: {e}"))?;
+            let check = veloframe_win::verify::check_video(std::path::Path::new(&clip.path), clip.frames).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&clip.path);
+            engine.stop_buffer();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            println!(
+                "  {cycle:>3} Durchgänge ({:.0} s): {} Handles ({:+}), Task-Manager {:.1} MB ({:+.1}), letzter Clip {} Bilder / {:?} → {} Bilder lesbar",
+                started.elapsed().as_secs_f64(),
+                handle_count(),
+                handle_count() as i64 - handles0 as i64,
+                mb(private_working_set()),
+                mb(private_working_set()) - mb(ram0),
+                clip.frames,
+                clip.audio_tracks,
+                check.frames
+            );
+        } else {
+            engine.stop_buffer();
+        }
+    }
+    println!("{cycles} × Start/Stopp ohne Absturz, Ton fehlte {failures}×");
+
+    // Ohne AAC-Encoder.
+    unsafe { std::env::set_var("VELOFRAME_SIMULATE_NO_AAC", "1") };
+    let status = engine.start_buffer(&request(AudioRequest::default())).map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let status2 = engine.buffer_status();
+    let clip = engine.save_clip(&SaveClipRequest { folder, seconds: None }).map_err(|e| e.to_string())?;
+    engine.stop_buffer();
+    unsafe { std::env::remove_var("VELOFRAME_SIMULATE_NO_AAC") };
+    println!(
+        "Ohne AAC-Encoder: Start ok (running {}), nach 3 s {} Bilder kodiert, audio.error = {:?}; Clip {:.1} s, {} Bilder, Tonspuren {:?}",
+        status.running,
+        status2.frames_encoded,
+        status2.audio.and_then(|a| a.error),
+        clip.duration_seconds,
+        clip.frames,
+        clip.audio_tracks
+    );
+    let _ = std::fs::remove_file(&clip.path);
+    Ok(())
+}
+
+/// Gerätewechsel live: nimmt `seconds` lang mit System + Mikrofon auf und meldet jede Änderung
+/// (Gerät, Gerätewechsel, gefüllte Stille). Währenddessen von Hand: Headset-Dongle ab- und wieder
+/// anstecken, Standard-Ausgabe und -Eingabe in Windows umstellen. Am Ende wird der Clip geprüft.
+#[cfg(windows)]
+fn devices_test(seconds: u32) -> Result<(), String> {
+    use veloframe::{AudioRequest, BufferRequest, ClipMode, Microphone, Quality, Resolution, SaveClipRequest, SystemAudio, TrackLayout};
+    let folder = std::env::temp_dir().join("veloframe-clips");
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let request = BufferRequest {
+        mode: ClipMode::Performance,
+        seconds: seconds.clamp(5, 60),
+        fps: 60,
+        quality: Quality::Medium,
+        resolution: Resolution::Native,
+        codec: None,
+        storage: None,
+        screen,
+        audio: AudioRequest { system: SystemAudio::All, microphone: Microphone::Default, tracks: TrackLayout::Both, ..Default::default() },
+        cursor: true,
+    };
+    engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    println!("Läuft {seconds} s. Jetzt Headset ab-/anstecken oder das Standardgerät umstellen …");
+    let started = Instant::now();
+    let mut last: Vec<(String, u32, f64, bool)> = Vec::new();
+    let mut frames0 = 0;
+    while started.elapsed().as_secs() < seconds as u64 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let status = engine.buffer_status();
+        let Some(audio) = status.audio else { continue };
+        let now: Vec<(String, u32, f64, bool)> =
+            audio.sources.iter().map(|s| (s.device.clone().unwrap_or_default(), s.device_changes, s.silence_ms, s.active)).collect();
+        for (i, source) in audio.sources.iter().enumerate() {
+            let before = last.get(i);
+            if before.is_none_or(|b| b.0 != now[i].0 || b.1 != now[i].1 || b.3 != now[i].3) {
+                println!(
+                    "  {:>6.1} s: {:?} → {} (aktiv {}, Wechsel {}, Stille gefüllt bisher {:.0} ms, Video {} Bilder {}){}",
+                    started.elapsed().as_secs_f64(),
+                    source.source,
+                    now[i].0,
+                    now[i].3,
+                    now[i].1,
+                    now[i].2,
+                    status.frames_encoded,
+                    if status.frames_encoded > frames0 { "läuft" } else { "steht!" },
+                    source.warnings.iter().map(|w| format!(", Hinweis {}: {}", w.code, w.message)).collect::<String>()
+                );
+            }
+        }
+        frames0 = status.frames_encoded;
+        last = now;
+    }
+    let clip = engine.save_clip(&SaveClipRequest { folder, seconds: None }).map_err(|e| e.to_string())?;
+    if let Some(audio) = engine.buffer_status().audio {
+        print_audio(&audio);
+    }
+    let status = engine.buffer_status();
+    engine.stop_buffer();
+    println!("Video: {} Bilder kodiert, {} verworfen", status.frames_encoded, status.frames_dropped);
+    println!("Clip: {} ({:.1} s, Ton {:.1} s, Spuren {:?})", clip.path, clip.duration_seconds, clip.audio_seconds, clip.audio_tracks);
+    let video = veloframe_win::verify::check_video(std::path::Path::new(&clip.path), clip.frames).map_err(|e| e.to_string())?;
+    println!("Windows-Decoder: {} Bilder, {:.2} s", video.frames, video.duration_seconds);
+    for (n, track) in veloframe_win::verify::check_audio_tracks(std::path::Path::new(&clip.path)).map_err(|e| e.to_string())?.iter().enumerate() {
+        let levels: Vec<String> = track.rms_db(0.5).iter().map(|db| format!("{db:>4.0}")).collect();
+        println!("  Tonspur {}: {:.2} s, Pegel je 0,5 s: {}", n + 1, track.seconds(), levels.join(" "));
+    }
+    Ok(())
+}
+
+/// Clip-Anfang: speichert im selben Puffer mehrere Clips verschiedener Länge und prüft, ob jeder
+/// genau so lang ist wie verlangt (bildgenauer Anfang), wie er beginnt und wie lange das Speichern
+/// dauert. `codec`: H.264 (Windows-Decoder prüft) oder HEVC.
+#[cfg(windows)]
+fn start_test(mode: veloframe::ClipMode, codec: veloframe::VideoCodec) -> Result<(), String> {
+    use veloframe::{AudioRequest, BufferRequest, Quality, Resolution, SaveClipRequest, SystemAudio};
+    let folder = std::env::temp_dir().join("veloframe-clips");
+    let mut engine = Engine::new().map_err(|e| e.to_string())?;
+    let screen = main_screen(&engine)?;
+    let request = BufferRequest {
+        mode,
+        seconds: 15,
+        fps: 60,
+        quality: Quality::High,
+        resolution: Resolution::Native,
+        codec: Some(codec),
+        storage: None,
+        screen,
+        audio: AudioRequest { system: SystemAudio::All, ..Default::default() },
+        cursor: true,
+    };
+    let status = engine.start_buffer(&request).map_err(|e| e.to_string())?;
+    let plan = status.plan.ok_or("kein Plan")?;
+    println!("{:?} {:?}, Keyframe alle {} Bilder, Encoder {}", plan.mode, plan.codec, plan.gop_frames, status.encoder.unwrap_or_default());
+    std::thread::sleep(std::time::Duration::from_secs(17));
+    for seconds in [Some(5), Some(7), None, Some(3), Some(10), Some(4)] {
+        let clip = engine.save_clip(&SaveClipRequest { folder: folder.clone(), seconds }).map_err(|e| e.to_string())?;
+        let wanted = seconds.unwrap_or(plan.seconds) as f64;
+        let check = if codec == veloframe::VideoCodec::H264 {
+            veloframe_win::verify::check_video(std::path::Path::new(&clip.path), clip.frames)
+                .map(|c| format!("Windows-Decoder {} Bilder, {:.3} s, erstes Bild bei {:.1} ms", c.frames, c.duration_seconds, c.first_time as f64 / 1e4))
+                .unwrap_or_else(|e| format!("Windows-Decoder: {e}"))
+        } else {
+            "HEVC: Windows-Decoder fehlt".into()
+        };
+        println!(
+            "  {:>4.0} s verlangt: {:.3} s, {} Bilder, Anfang {:?} ({:+.1} ms), Ton {:.3} s, gespeichert in {:.0} ms (davon Neu-Kodieren {:.0} ms); {check}",
+            wanted,
+            clip.duration_seconds,
+            clip.frames,
+            clip.start,
+            clip.start_offset_ms,
+            clip.audio_seconds,
+            clip.save_ms,
+            clip.start_encode_ms
+        );
+        std::thread::sleep(std::time::Duration::from_millis(700));
+    }
+    engine.stop_buffer();
     Ok(())
 }
 
@@ -685,7 +1170,38 @@ fn main() {
         #[cfg(windows)]
         Some("check") => args.get(1).map_or(Err("Datei fehlt.".to_string()), |p| check_file(p)),
         #[cfg(windows)]
-        Some("sync") => sync(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(8), args.get(2).map(String::as_str) == Some("self"), args.get(3).cloned()),
+        #[cfg(windows)]
+        Some("start") => start_test(
+            if args.get(1).map(String::as_str) == Some("long") { veloframe::ClipMode::Long } else { veloframe::ClipMode::Performance },
+            if args.get(2).map(String::as_str) == Some("hevc") { veloframe::VideoCodec::Hevc } else { veloframe::VideoCodec::H264 },
+        ),
+        #[cfg(windows)]
+        Some("robust") => robust(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(50)),
+        #[cfg(windows)]
+        Some("devices") => devices_test(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(60)),
+        #[cfg(windows)]
+        Some("mic") => mic_test(
+            match args.get(1).map(String::as_str) {
+                None | Some("default") => veloframe::Microphone::Default,
+                Some(id) => veloframe::Microphone::Device(id.to_string()),
+            },
+            if args.get(2).map(String::as_str) == Some("separate") { veloframe::TrackLayout::Separate } else { veloframe::TrackLayout::Both },
+        ),
+        #[cfg(windows)]
+        Some("cursor") => cursor_test(match args.get(1).map(String::as_str) {
+            Some("1440p") => veloframe::Resolution::P1440,
+            Some("1080p") => veloframe::Resolution::P1080,
+            Some("720p") => veloframe::Resolution::P720,
+            _ => veloframe::Resolution::Native,
+        }),
+        Some("sync") => {
+            // sync [anzahl] [self] [performance|long] [h264|hevc] [ausgabegerät]
+            let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+            let mode = if rest.contains(&"performance") { veloframe::ClipMode::Performance } else { veloframe::ClipMode::Long };
+            let codec = if rest.contains(&"hevc") { veloframe::VideoCodec::Hevc } else { veloframe::VideoCodec::H264 };
+            let output = rest.iter().find(|a| !["self", "performance", "long", "h264", "hevc"].contains(a)).map(|s| s.to_string());
+            sync(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(8), rest.contains(&"self"), output, mode, codec)
+        }
         _ => Err("Aufruf: veloframe-bench encode <bild.png>...  |  capture [anzahl]  |  memory  |  clip [performance|long] [sekunden] [laufzeit] [auto|h264|hevc] [host|all|mic|off|<pid>]  |  audio  |  sync [anzahl]".into()),
     };
     if let Err(error) = result {

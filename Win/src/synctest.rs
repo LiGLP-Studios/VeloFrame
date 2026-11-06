@@ -95,6 +95,18 @@ impl Flasher {
         qpc_now()
     }
 
+    /// Welcher Mauszeiger über dem Fenster erscheint: Fadenkreuz (Hotspot in der Mitte, invertierend)
+    /// oder Pfeil (Farbe mit Alpha, Hotspot an der Spitze).
+    pub fn set_cursor(&self, cross: bool) {
+        unsafe {
+            if let Ok(cursor) = LoadCursorW(None, if cross { IDC_CROSS } else { IDC_ARROW }) {
+                SetClassLongPtrW(self.hwnd, GCLP_HCURSOR, cursor.0 as isize);
+                SetCursor(cursor);
+            }
+        }
+        self.pump();
+    }
+
     /// Die kleine Ecke neu malen: Der Bildschirm ändert sich dann ständig, wie bei einem Spiel.
     pub fn tick(&self) {
         TICK.fetch_add(1, Ordering::Relaxed);

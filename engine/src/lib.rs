@@ -30,7 +30,7 @@ mod platform;
 pub mod upload;
 
 pub use veloframe_core::audio::{self, AudioDevice, AudioRequest, AudioSetRequest, AudioStatus, Microphone, SourceControl, SystemAudio, TrackKind, TrackLayout};
-pub use veloframe_core::clip::{Quality, Resolution, Storage};
+pub use veloframe_core::clip::{ClipStart, CursorSetRequest, Quality, Resolution, Storage};
 pub use veloframe_core::{
     Area, BufferRequest, BufferStatus, ClipMode, ClipResult, Error, ImageFormat, Rect, Result, SaveClipRequest, ScreenshotRequest,
     ScreenshotResult, VideoCodec,
@@ -101,6 +101,12 @@ impl Engine {
     /// Lautstärke oder Stummschaltung je Tonquelle, während der Puffer läuft (z. B. Push-to-Talk).
     pub fn set_audio(&self, request: &AudioSetRequest) -> Result<AudioStatus> {
         self.platform.set_audio(request)
+    }
+
+    /// Mauszeiger im laufenden Puffer ein- oder ausschalten (ab dem nächsten Bild, z. B. per Hotkey).
+    /// Gibt den Zustand des Puffers zurück; `cursor` zeigt die neue Einstellung.
+    pub fn set_cursor(&self, visible: bool) -> Result<BufferStatus> {
+        self.platform.set_cursor(&CursorSetRequest { visible })
     }
 
     /// Prozess, dessen Ton bei `all-except-host` nie im Clip landet. Ohne Angabe: dieser Prozess.

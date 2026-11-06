@@ -1,5 +1,5 @@
 //! Befehle des Leitungsprotokolls: `ping`, `version`, `system-check`, `warm-up`, `screenshot`, `copy`,
-//! `buffer-start`, `buffer-status`, `save-clip`, `buffer-stop`, `audio-devices`, `audio-set`.
+//! `buffer-start`, `buffer-status`, `save-clip`, `buffer-stop`, `audio-devices`, `audio-set`, `cursor-set`.
 //!
 //! Nutzt das Programm `veloframe`; Programme, die die Engine als Bibliothek einbetten und trotzdem
 //! JSON sprechen wollen, können [`dispatch`] direkt aufrufen.
@@ -38,6 +38,7 @@ pub fn dispatch(engine: &mut Engine, request: &Request) -> Value {
         "save-clip" => args(request, "save-clip").and_then(|a| engine.save_clip(&a)).map(to_json),
         "audio-devices" => engine.audio_devices().map(to_json),
         "audio-set" => args(request, "audio-set").and_then(|a| engine.set_audio(&a)).map(to_json),
+        "cursor-set" => args::<veloframe_core::clip::CursorSetRequest>(request, "cursor-set").and_then(|a| engine.set_cursor(a.visible)).map(to_json),
         "buffer-stop" => {
             engine.stop_buffer();
             Ok(json!(true))

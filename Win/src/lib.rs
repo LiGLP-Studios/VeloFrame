@@ -8,6 +8,7 @@
 //! - `video`: Bildquelle und NV12-Umrechnung für Videos auf der GPU
 //! - `encode`: Hardware-Video-Encoder über Media Foundation (NVENC, AMF, QuickSync)
 //! - `record`: Clip-Puffer (Aufnahme-Thread, Replay-Puffer, MP4 speichern)
+//! - `smartstart`: bildgenauer Clip-Anfang (nur den Anfang bis zum nächsten Keyframe neu kodieren)
 //! - `wasapi`: Tonquellen (System-, Prozess-Loopback, Mikrofon), Geräteliste, Gerätewechsel
 //! - `aac`: AAC-Encoder (und Decoder für Tests) über Media Foundation
 //! - `audio`: Ton-Thread des Clip-Puffers (Zeitachse, Mischen, Kodieren)
@@ -23,6 +24,7 @@ pub mod desktop;
 pub mod duplication;
 pub mod encode;
 pub mod record;
+pub mod smartstart;
 pub mod synctest;
 pub mod system;
 pub mod verify;

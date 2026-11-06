@@ -126,6 +126,10 @@ impl AacEncoder {
         media_foundation()?;
         let activates = find_audio_transforms(MFT_CATEGORY_AUDIO_ENCODER, MFAudioFormat_PCM, MFAudioFormat_AAC);
         let mut last = Error::Unsupported("Kein AAC-Encoder gefunden (Windows N ohne Media Feature Pack?).".into());
+        // Testschalter: verhält sich wie Windows N ohne Media Feature Pack (für `veloframe-bench robust`).
+        if std::env::var_os("VELOFRAME_SIMULATE_NO_AAC").is_some() {
+            return Err(last);
+        }
         for activate in activates {
             match unsafe { Self::open(&activate, sample_rate, channels, bitrate) } {
                 Ok(mut encoder) => {

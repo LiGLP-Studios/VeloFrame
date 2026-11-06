@@ -114,6 +114,8 @@ pub struct HardwareEncoder {
     sequence_header: Option<ParameterSets>,
     /// Aktivierungsobjekt des Encoders: über dieses wird er am Ende abgeschlossen (`ShutdownObject`).
     activate: ManuallyDrop<IMFActivate>,
+    /// Schon mit `finish` geleert: Beim Abbau nicht noch einmal.
+    drained: bool,
 }
 
 impl HardwareEncoder {
@@ -137,6 +139,7 @@ impl HardwareEncoder {
                         need_input: 0,
                         sequence_header: None,
                         activate: ManuallyDrop::new(activate.clone()),
+                        drained: false,
                     });
                 }
                 Err(error) => last_error = error,
@@ -254,6 +257,22 @@ impl HardwareEncoder {
         }
     }
 
+    /// Nach `finish` weiterbenutzen: Das nächste Bild wird ein Keyframe (neues, eigenständiges Stück).
+    /// `false`, wenn der Encoder das nicht kann.
+    pub fn restart(&mut self) -> bool {
+        self.drained = false;
+        self.need_input = 0;
+        unsafe {
+            // Nach dem Leeren ist der Strom zu Ende: neu beginnen, erst dann fragt der Encoder wieder
+            // nach Bildern.
+            if self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).is_err() {
+                return false;
+            }
+            let Ok(api) = self.transform.cast::<ICodecAPI>() else { return false };
+            api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)).is_ok()
+        }
+    }
+
     /// Ob der Encoder gerade ein Bild annimmt.
     pub fn wants_input(&self) -> bool {
         self.need_input > 0
@@ -353,6 +372,38 @@ impl HardwareEncoder {
         Ok(())
     }
 
+    /// Meldet das Ende, wartet, bis der Encoder alle Bilder kodiert hat, und gibt die restlichen
+    /// Pakete weiter (für Stücke mit festem Ende, z. B. den bildgenauen Clip-Anfang).
+    pub fn finish(&mut self, mut packet: impl FnMut(&[u8], PacketInfo, Option<&ParameterSets>)) -> Result<()> {
+        unsafe {
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).map_err(mf("Encoder leeren"))?;
+        }
+        self.drained = true;
+        // Anfragen von vor dem Leeren gelten nicht mehr; danach fragt der Encoder neu an.
+        self.need_input = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    let kind = unsafe { event.GetType() }.map_err(mf("Encoder-Ereignis"))?;
+                    if kind == METransformDrainComplete.0 as u32 {
+                        return Ok(());
+                    } else if kind == METransformHaveOutput.0 as u32 {
+                        self.take_output(&mut packet)?;
+                    }
+                }
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    if std::time::Instant::now() > deadline {
+                        return Err(Error::Capture("Der Encoder ist nicht fertig geworden.".into()));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(mf("Encoder-Ereignis")(e)),
+            }
+        }
+    }
+
     /// Parametersätze aus dem Ausgabetyp (falls der Encoder sie nicht in jedes Keyframe schreibt).
     fn read_sequence_header(&self) -> Option<ParameterSets> {
         unsafe {
@@ -374,7 +425,7 @@ impl Drop for HardwareEncoder {
             // restliche Pakete abholen, bis der Encoder „fertig“ meldet (höchstens 1 s). Erst dann
             // arbeitet kein Encoder-Thread mehr auf der GPU, und alles darf freigegeben werden.
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            if self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).is_ok() {
+            if !self.drained && self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).is_ok() {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
                 while std::time::Instant::now() < deadline {
                     match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {

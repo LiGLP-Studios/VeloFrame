@@ -8,6 +8,7 @@ pub mod capture;
 pub mod clip;
 pub mod codec;
 pub mod config;
+pub mod cursor;
 pub mod encode;
 pub mod error;
 pub mod frame;
