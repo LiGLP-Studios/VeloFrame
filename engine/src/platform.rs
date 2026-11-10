@@ -56,10 +56,15 @@ mod imp {
             source.release_all();
             let started = Recorder::start(request);
             let source = self.screenshots.source_mut();
-            if let Ok(recorder) = &started {
-                source.set_tap(Some(recorder.tap()));
+            match &started {
+                // Screenshots des aufgenommenen Bildschirms kommen aus dem Puffer. Andere Bildschirme
+                // werden erst beim Screenshot geöffnet: Jede offene Aufnahme kostet ein Direct3D-Gerät
+                // (6–8 MB), solange der Puffer läuft, zählt der Arbeitsspeicher.
+                Ok(recorder) => source.set_tap(Some(recorder.tap())),
+                Err(_) => {
+                    let _ = source.warm_up();
+                }
             }
-            let _ = source.warm_up();
             let recorder = started?;
             let status = recorder.status();
             self.recorder = Some(recorder);
@@ -88,6 +93,14 @@ mod imp {
 
         pub fn warm_up(&mut self) -> Result<usize> {
             self.screenshots.warm_up()
+        }
+
+        pub fn release_idle(&mut self) {
+            self.screenshots.release_idle(veloframe_core::pipeline::LAST_SHOT_KEEP);
+            self.screenshots.source_mut().release_idle(veloframe_core::pipeline::LAST_SHOT_KEEP);
+            if let Some(recorder) = &self.recorder {
+                recorder.release_idle();
+            }
         }
 
         pub fn screenshot(&mut self, request: &ScreenshotRequest) -> Result<ScreenshotResult> {
@@ -126,6 +139,9 @@ mod imp {
             Err(unsupported())
         }
         pub fn warm_up(&mut self) -> Result<usize> {
+            match *self {}
+        }
+        pub fn release_idle(&mut self) {
             match *self {}
         }
         pub fn set_host_process(&mut self, _: Option<u32>) {

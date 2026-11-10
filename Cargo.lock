@@ -257,7 +257,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "veloframe"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "veloframe-bench"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "jpeg-encoder",
  "png",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "veloframe-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "crc32fast",
  "jpeg-decoder",
@@ -295,21 +295,21 @@ dependencies = [
 
 [[package]]
 name = "veloframe-linux"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "veloframe-core",
 ]
 
 [[package]]
 name = "veloframe-mac"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "veloframe-core",
 ]
 
 [[package]]
 name = "veloframe-win"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "veloframe-core",

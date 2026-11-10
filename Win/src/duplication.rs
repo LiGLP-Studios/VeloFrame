@@ -2,14 +2,13 @@
 //! zeigt keinen Aufnahmerahmen. Die Aufnahme bleibt zwischen Screenshots offen, nur der erste zahlt
 //! die Einrichtung.
 
-use veloframe_core::frame::BgraView;
 use veloframe_core::{Captured, Error, Rect, Result, RgbImage, Rotation, ScreenSource};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
@@ -41,9 +40,13 @@ struct Output {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
-    /// Hält das neueste vollständige Bild. Desktop Duplication liefert nur bei Änderungen ein Bild;
-    /// hat sich nichts geändert, ist diese Kopie noch der aktuelle Bildschirm.
-    staging: Option<ID3D11Texture2D>,
+    /// Hält das neueste vollständige Bild im Speicher der Grafikkarte. Desktop Duplication liefert nur
+    /// bei Änderungen ein Bild; hat sich nichts geändert, ist diese Kopie noch der aktuelle Bildschirm.
+    /// Zur CPU wandert erst beim Screenshot der angefragte Ausschnitt: Ein ganzer Bildschirm (8 MB bei
+    /// 1080p, 33 MB bei 4K) liegt so nicht dauerhaft im Arbeitsspeicher der Engine.
+    latest: Option<ID3D11Texture2D>,
+    /// Letzter Screenshot von diesem Bildschirm (oder das Öffnen), siehe `release_idle`.
+    used: Instant,
 }
 
 /// Alle Bildschirme, die am Desktop hängen, mit ihrer Grafikkarte.
@@ -103,7 +106,7 @@ fn open(adapter: &IDXGIAdapter, output: &IDXGIOutput1, rect: Rect) -> Result<Out
         DXGI_MODE_ROTATION_ROTATE270 => Rotation::Rotate270,
         _ => Rotation::Identity,
     };
-    Ok(Output { rect, rotation, device, context, duplication, staging: None })
+    Ok(Output { rect, rotation, device, context, duplication, latest: None, used: Instant::now() })
 }
 
 /// Ob Desktop Duplication auf diesem System auf mindestens einem Bildschirm funktioniert.
@@ -114,29 +117,30 @@ pub fn available() -> bool {
 }
 
 impl Output {
-    /// Kopiert ein neues Desktop-Bild in die gespeicherte Kopie (wird beim ersten Mal angelegt).
+    /// Kopiert ein neues Desktop-Bild in die gespeicherte Kopie (wird beim ersten Mal angelegt), GPU → GPU.
     fn store(&mut self, resource: Option<IDXGIResource>) -> Result<()> {
         let texture: ID3D11Texture2D = resource
             .ok_or_else(|| Error::Capture("Kein Bild geliefert.".into()))?
             .cast()
             .map_err(classify)?;
         unsafe {
-            if self.staging.is_none() {
+            if self.latest.is_none() {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 texture.GetDesc(&mut desc);
-                desc.Usage = D3D11_USAGE_STAGING;
-                desc.BindFlags = 0;
-                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+                desc.CPUAccessFlags = 0;
                 desc.MiscFlags = 0;
-                self.device.CreateTexture2D(&desc, None, Some(&mut self.staging)).map_err(classify)?;
+                self.device.CreateTexture2D(&desc, None, Some(&mut self.latest)).map_err(classify)?;
             }
-            self.context.CopyResource(self.staging.as_ref().unwrap(), &texture);
+            self.context.CopyResource(self.latest.as_ref().unwrap(), &texture);
         }
         Ok(())
     }
 
     /// Bringt die gespeicherte Kopie auf den neuesten Stand und kopiert `region` (Desktop-Koordinaten) heraus.
     fn grab(&mut self, region: Rect, out: &mut RgbImage) -> Result<()> {
+        self.used = Instant::now();
         self.refresh()?;
         self.read(region, out)
     }
@@ -150,17 +154,17 @@ impl Output {
         loop {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
-            let timeout = if self.staging.is_some() { 0 } else { 100 };
+            let timeout = if self.latest.is_some() { 0 } else { 100 };
             match unsafe { self.duplication.AcquireNextFrame(timeout, &mut info, &mut resource) } {
                 Ok(()) => {
                     let stored = if info.LastPresentTime != 0 { self.store(resource) } else { Ok(()) };
                     let _ = unsafe { self.duplication.ReleaseFrame() };
                     stored?;
-                    if self.staging.is_some() {
+                    if self.latest.is_some() {
                         break;
                     }
                 }
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT && self.staging.is_some() => break,
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT && self.latest.is_some() => break,
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
                 Err(e) => return Err(classify(e)),
             }
@@ -171,28 +175,19 @@ impl Output {
         Ok(())
     }
 
-    /// Liest `region` (Desktop-Koordinaten) aus der gespeicherten Kopie als RGB.
+    /// Liest `region` (Desktop-Koordinaten) aus der gespeicherten Kopie als RGB: Der Ausschnitt wird
+    /// auf der GPU in eine kurzlebige lesbare Textur kopiert, nur er wandert zur CPU.
     fn read(&mut self, region: Rect, out: &mut RgbImage) -> Result<()> {
-        let staging = self.staging.as_ref().unwrap();
+        let latest = self.latest.as_ref().unwrap();
         let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { staging.GetDesc(&mut desc) };
+        unsafe { latest.GetDesc(&mut desc) };
         let (width, height) = (self.rect.width as usize, self.rect.height as usize);
         // Das Auslesen verlässt sich auf diese Größe. Passt sie nicht, hat sich der Bildschirm seit dem
         // Öffnen geändert: neu öffnen statt über das Bild hinaus zu lesen.
         if (desc.Width as usize, desc.Height as usize) != self.rotation.image_size(width, height) {
             return Err(Error::CaptureLost("Das Bild passt nicht zur Größe des Bildschirms.".into()));
         }
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.map_err(classify)?;
-        let pitch = mapped.RowPitch as usize;
-        let len = pitch * (desc.Height as usize - 1) + desc.Width as usize * 4;
-        // SAFETY: Map liefert bei Erfolg einen lesbaren Block von mindestens `len` Bytes, der bis
-        // Unmap gültig bleibt. Die Ansicht wird vor Unmap nicht mehr benutzt.
-        let pixels = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, len) };
-        let view = BgraView { pixels, pitch, width, height, rotation: self.rotation };
-        view.crop_to_rgb(region.relative_to(&self.rect), out);
-        unsafe { self.context.Unmap(staging, 0) };
-        Ok(())
+        crate::record::read_region(&self.device, &self.context, latest, region.relative_to(&self.rect), (width, height), self.rotation, out)
     }
 }
 
@@ -219,6 +214,17 @@ impl DesktopDuplication {
     /// Gibt alle offenen Aufnahmen frei (z. B. bevor der Clip-Puffer einen Bildschirm übernimmt).
     pub fn release_all(&mut self) {
         self.open.clear();
+    }
+
+    /// Solange der Clip-Puffer läuft: gibt Aufnahmen anderer Bildschirme frei, die seit `keep` kein
+    /// Screenshot gebraucht hat. Jede offene Aufnahme hält ein eigenes Direct3D-Gerät (gemessen 6–8 MB
+    /// Arbeitsspeicher); der Bildschirm des Puffers braucht keins, seine Screenshots kommen aus dem
+    /// Puffer. Der nächste Screenshot eines anderen Bildschirms öffnet ihn wieder (100–300 ms).
+    /// Ohne Puffer bleibt alles offen, damit jeder Screenshot schnell ist.
+    pub fn release_idle(&mut self, keep: Duration) {
+        if self.tap.is_some() {
+            self.open.retain(|o| o.used.elapsed() < keep);
+        }
     }
 
     /// Verbindet mit einer laufenden Aufnahme (oder trennt mit `None`). Deren Bildschirm wird hier

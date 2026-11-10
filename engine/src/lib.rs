@@ -60,6 +60,15 @@ impl Engine {
         self.platform.warm_up()
     }
 
+    /// Gibt Speicher frei, der nur zum Beschleunigen bereitliegt und eine Weile nicht gebraucht wurde:
+    /// den letzten Screenshot (nach 60 s; `copy_screenshot` meldet für ihn dann `Error::NotCached`) und
+    /// den zweiten Encoder für den bildgenauen Clip-Anfang (nach 30 s ohne `save_clip`; der nächste
+    /// Clip richtet ihn neu ein). Kostet nichts, wenn nichts frei wird: am besten alle paar Sekunden
+    /// aufrufen. `veloframe.exe` tut das selbst.
+    pub fn release_idle(&mut self) {
+        self.platform.release_idle()
+    }
+
     /// Nimmt einen Screenshot auf und speichert ihn.
     pub fn screenshot(&mut self, request: &ScreenshotRequest) -> Result<ScreenshotResult> {
         self.platform.screenshot(request)

@@ -71,6 +71,8 @@ pub struct Lead {
 struct Decoder {
     transform: IMFTransform,
     _manager: IMFDXGIDeviceManager,
+    /// Über das Aktivierungsobjekt wird der Decoder am Ende abgeschlossen (`ShutdownObject`).
+    activate: IMFActivate,
 }
 
 impl Decoder {
@@ -107,7 +109,7 @@ impl Decoder {
             input.SetUINT64(&MF_MT_FRAME_RATE, ((plan.fps as u64) << 32) | 1).map_err(mf("Medientyp"))?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(mf("Medientyp"))?;
             transform.SetInputType(0, &input, 0).map_err(mf("Eingabeformat vom Decoder abgelehnt"))?;
-            let decoder = Self { transform, _manager: manager };
+            let decoder = Self { transform, _manager: manager, activate: activate.clone() };
             decoder.choose_nv12()?;
             transform_start(&decoder.transform)?;
             Ok(decoder)
@@ -196,10 +198,16 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
+            // Bilder und GPU-Gerät loslassen, bevor der Decoder geht: Ohne das Lösen vom Gerätemanager
+            // hält er sein Gerät und seine Bilder weiter fest (gemessen: 3–4 MB mehr je Clip, und das
+            // zweite GPU-Gerät blieb auch nach dem Stoppen des Puffers liegen).
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
             if let Ok(shutdown) = self.transform.cast::<IMFShutdown>() {
                 let _ = shutdown.Shutdown();
             }
+            let _ = self.activate.ShutdownObject();
         }
     }
 }

@@ -31,10 +31,11 @@ use veloframe_core::clip::{self, BufferRequest, BufferStatus, ClipResult, ClipSt
 use veloframe_core::mp4::{AudioTrack, Packet, PacketInfo, TICKS_PER_SECOND, VideoTrack, write_mp4};
 use veloframe_core::replay::{FileStore, RamStore, ReplayBuffer, Store};
 use veloframe_core::screenshot::create_unique_file;
-use veloframe_core::frame::{BgraView, Rotation};
+use veloframe_core::frame::{BgraView, Rotation, bgra_to_rgb};
 use veloframe_core::{Desktop, Error, Rect, Result, RgbImage};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Texture2D,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Texture2D,
 };
 
 /// Bitte um einen Ausschnitt des aktuellen Bildes (Desktop-Koordinaten).
@@ -73,6 +74,11 @@ struct Shared {
     error_at: Option<Instant>,
 }
 
+/// So lange bleiben GPU-Gerät und Encoder für den bildgenauen Clip-Anfang nach einem Clip bereit.
+/// Warm kosten sie gemessen rund 70 MB Arbeitsspeicher (zweites Gerät, zweiter Encoder, Decoder):
+/// kurz halten, damit mehrere Clips hintereinander schnell sind, dann freigeben.
+const SMART_START_KEEP: Duration = Duration::from_secs(30);
+
 /// So lange bleibt ein Fehler im Status stehen, nachdem er zuletzt auftrat. Kurze Störungen (UAC,
 /// Vollbildwechsel) sieht die Anwendung so noch, ein behobener Fehler verschwindet danach wieder.
 const ERROR_HOLD: Duration = Duration::from_secs(5);
@@ -104,8 +110,9 @@ pub struct Recorder {
     /// Grafikkarte der Aufnahme (dort wird auch der bildgenaue Anfang neu kodiert).
     luid: u64,
     frames: mpsc::Sender<FrameRequest>,
-    /// GPU und Encoder für den bildgenauen Anfang, nach dem ersten Clip bereitgehalten.
-    smart_start: Mutex<Option<smartstart::SmartStart>>,
+    /// GPU und Encoder für den bildgenauen Anfang, nach dem ersten Clip bereitgehalten, mit der Zeit
+    /// der letzten Benutzung (siehe `release_idle`).
+    smart_start: Mutex<Option<(smartstart::SmartStart, Instant)>>,
     /// Mauszeiger ins Video zeichnen (gilt ab dem nächsten Bild).
     cursor: Arc<AtomicBool>,
     audio: Option<AudioRecorder>,
@@ -155,12 +162,28 @@ fn image_box(region: Rect, screen: (usize, usize), rotation: Rotation) -> Rect {
     Rect::new(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32)
 }
 
+/// So viel liest ein Screenshot höchstens auf einmal von der GPU (Bytes). Die lesbare Textur dafür
+/// liegt im Arbeitsspeicher, und der Grafiktreiber behält ihn nach dem Freigeben: Ein ganzer
+/// Bildschirm auf einmal ließ 8 MB (1080p) dauerhaft liegen, gemessen auf der RTX 3050.
+const STRIP_BYTES: usize = 1 << 20;
+
 /// Kopiert `region` (relativ zum Bildschirm, `screen` groß wie der Desktop ihn zeigt) aus dem
-/// aktuellen GPU-Bild und liest es als RGB, aufrecht gedreht. Nur dieser Ausschnitt wandert zur CPU;
-/// die Kopie dafür wird danach wieder freigegeben.
-fn read_region(gpu: &Gpu, latest: &ID3D11Texture2D, region: Rect, screen: (usize, usize), rotation: Rotation, out: &mut RgbImage) -> Result<()> {
+/// aktuellen GPU-Bild und liest es als RGB, aufrecht gedreht. Nur dieser Ausschnitt wandert zur CPU,
+/// in Streifen von höchstens `STRIP_BYTES` (gedrehte Bildschirme: am Stück, ihre Zeilen laufen quer).
+pub(crate) fn read_region(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    latest: &ID3D11Texture2D,
+    region: Rect,
+    screen: (usize, usize),
+    rotation: Rotation,
+    out: &mut RgbImage,
+) -> Result<()> {
     let failed = |e: windows::core::Error| Error::Capture(format!("Bild aus dem Clip-Puffer: {e}"));
     let source = image_box(region, screen, rotation);
+    let (width, height) = (region.width as usize, region.height as usize);
+    let strips = rotation == Rotation::Identity;
+    let rows = if strips { (STRIP_BYTES / (width.max(1) * 4)).clamp(1, height.max(1)) } else { source.height as usize };
     unsafe {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         latest.GetDesc(&mut desc);
@@ -168,31 +191,39 @@ fn read_region(gpu: &Gpu, latest: &ID3D11Texture2D, region: Rect, screen: (usize
             return Err(Error::CaptureLost("Das Bild passt nicht zur Größe des Bildschirms.".into()));
         }
         desc.Width = source.width as u32;
-        desc.Height = source.height as u32;
+        desc.Height = rows as u32;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
         desc.MiscFlags = 0;
         let mut staging = None;
-        gpu.device.CreateTexture2D(&desc, None, Some(&mut staging)).map_err(failed)?;
+        device.CreateTexture2D(&desc, None, Some(&mut staging)).map_err(failed)?;
         let staging = staging.unwrap();
-        let area = D3D11_BOX {
-            left: source.x as u32,
-            top: source.y as u32,
-            front: 0,
-            right: source.right() as u32,
-            bottom: source.bottom() as u32,
-            back: 1,
-        };
-        gpu.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, latest, 0, Some(&area));
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(failed)?;
-        let (width, height) = (region.width as usize, region.height as usize);
-        let pitch = mapped.RowPitch as usize;
-        // SAFETY: Map liefert mindestens pitch × (Höhe − 1) + Breite × 4 lesbare Bytes bis Unmap.
-        let pixels = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (source.height as usize - 1) + source.width as usize * 4);
-        BgraView { pixels, pitch, width, height, rotation }.crop_to_rgb(Rect::new(0, 0, region.width, region.height), out);
-        gpu.context.Unmap(&staging, 0);
+        if strips {
+            out.reset(width, height);
+        }
+        let mut done = 0;
+        while done < source.height as usize {
+            let count = rows.min(source.height as usize - done);
+            let top = source.y as u32 + done as u32;
+            let area = D3D11_BOX { left: source.x as u32, top, front: 0, right: source.right() as u32, bottom: top + count as u32, back: 1 };
+            context.CopySubresourceRegion(&staging, 0, 0, 0, 0, latest, 0, Some(&area));
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(failed)?;
+            let pitch = mapped.RowPitch as usize;
+            // SAFETY: Map liefert mindestens pitch × (Zeilen − 1) + Breite × 4 lesbare Bytes bis Unmap.
+            let pixels = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (count - 1) + source.width as usize * 4);
+            if strips {
+                let target = out.data[done * width * 3..(done + count) * width * 3].chunks_exact_mut(width * 3);
+                for (row, target) in target.enumerate() {
+                    bgra_to_rgb(&pixels[row * pitch..row * pitch + width * 4], target);
+                }
+            } else {
+                BgraView { pixels, pitch, width, height, rotation }.crop_to_rgb(Rect::new(0, 0, region.width, region.height), out);
+            }
+            context.Unmap(&staging, 0);
+            done += count;
+        }
     }
     Ok(())
 }
@@ -381,7 +412,7 @@ fn run(
                         Err(Error::CaptureLost("Der Bildschirm hat seine Größe geändert.".into()))
                     }
                     (Some(latest), Some(part)) => {
-                        read_region(&p.gpu, latest, part.relative_to(&screen), desktop, p.grabber.rotation, &mut image).map(|()| image)
+                        read_region(&p.gpu.device, &p.gpu.context, latest, part.relative_to(&screen), desktop, p.grabber.rotation, &mut image).map(|()| image)
                     }
                     (None, _) => Err(Error::Capture("Der Clip-Puffer hat noch kein Bild.".into())),
                     (_, None) => Err(Error::NoScreen("Der Bereich liegt nicht auf dem aufgenommenen Bildschirm.".into())),
@@ -607,12 +638,25 @@ impl Recorder {
         let mut smart = self.smart_start.lock().unwrap();
         if smart.is_none() {
             let t = Instant::now();
-            *smart = Some(smartstart::SmartStart::new(Gpu::new(&adapter_by_luid(self.luid)?)?, &self.plan));
+            *smart = Some((smartstart::SmartStart::new(Gpu::new(&adapter_by_luid(self.luid)?)?, &self.plan), t));
             if crate::trace() {
                 eprintln!("trace: Speichern: GPU-Gerät nach {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
             }
         }
-        smart.as_mut().unwrap().reencode(&snapshot.sets, &gop, start, end)
+        let (smart, used) = smart.as_mut().unwrap();
+        let lead = smart.reencode(&snapshot.sets, &gop, start, end);
+        *used = Instant::now();
+        lead
+    }
+
+    /// Gibt GPU-Gerät und Encoder für den bildgenauen Anfang frei, wenn seit [`SMART_START_KEEP`] kein
+    /// Clip sie gebraucht hat. Der nächste Clip richtet sie neu ein (das kostet ihn 0,2–0,35 s, unter
+    /// Spiellast gemessen bis 1,7 s); wer in kurzen Abständen speichert, merkt davon nichts.
+    pub fn release_idle(&self) {
+        let mut smart = self.smart_start.lock().unwrap();
+        if smart.as_ref().is_some_and(|(_, used)| used.elapsed() >= SMART_START_KEEP) {
+            *smart = None;
+        }
     }
 
     /// Schreibt den Puffer (oder die letzten `seconds`) als MP4. Die Aufnahme läuft dabei weiter:

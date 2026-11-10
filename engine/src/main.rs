@@ -4,11 +4,19 @@
 //! Eine JSON-Anfrage pro Zeile auf stdin, eine Antwort pro Zeile auf stdout (Protokoll in
 //! `veloframe_core::ipc`). Beim Start kommt `{"event": "ready", ...}`, danach wärmt die Engine die
 //! Aufnahme vor. Endet stdin, beendet sich die Engine.
+//!
+//! Die Zeilen liest ein eigener Thread: So kann die Engine zwischen zwei Anfragen Speicher freigeben,
+//! der eine Weile nicht gebraucht wurde (`Engine::release_idle`).
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 use veloframe::Engine;
 use veloframe_core::ipc;
+
+/// So oft prüft die Engine ohne Anfragen, ob sie Speicher freigeben kann.
+const IDLE_CHECK: Duration = Duration::from_secs(10);
 
 fn send(value: &serde_json::Value) {
     let mut out = io::stdout().lock();
@@ -33,8 +41,27 @@ fn main() -> ExitCode {
     // meldet der erste Screenshot den eigentlichen Fehler.
     let _ = engine.warm_up();
 
-    for line in io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
+    let (lines_tx, lines) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::Builder::new().name("veloframe-stdin".into()).spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    if reader.is_err() {
+        return ExitCode::FAILURE;
+    }
+    loop {
+        let line = match lines.recv_timeout(IDLE_CHECK) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                engine.release_idle();
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }

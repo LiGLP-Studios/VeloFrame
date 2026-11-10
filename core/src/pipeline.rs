@@ -13,12 +13,18 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-/// Der letzte Screenshot bleibt im Speicher: Erneutes Kopieren braucht dann weder Datei noch
-/// Dekodieren, und sein Puffer wird für den nächsten Screenshot wiederverwendet.
+/// Der letzte Screenshot bleibt eine Weile im Speicher: Erneutes Kopieren braucht dann weder Datei
+/// noch Dekodieren, und sein Puffer wird für den nächsten Screenshot wiederverwendet. Nach
+/// [`LAST_SHOT_KEEP`] ohne weiteren Screenshot gibt [`ScreenshotPipeline::release_idle`] ihn frei
+/// (6 MB bei 1080p, 25 MB bei 4K).
 struct LastShot {
     path: String,
     image: RgbImage,
+    taken: Instant,
 }
+
+/// So lange bleibt der letzte Screenshot für erneutes Kopieren im Speicher.
+pub const LAST_SHOT_KEEP: Duration = Duration::from_secs(60);
 
 pub struct ScreenshotPipeline<S, D> {
     source: S,
@@ -43,6 +49,16 @@ impl<S: ScreenSource, D: Desktop> ScreenshotPipeline<S, D> {
     /// Öffnet die Aufnahme vorab (siehe `ScreenSource::warm_up`).
     pub fn warm_up(&mut self) -> Result<usize> {
         self.source.warm_up()
+    }
+
+    /// Gibt den letzten Screenshot frei, wenn er älter als `keep` ist. Danach meldet `copy` für ihn
+    /// `Error::NotCached` (das Programm liest die Datei dann selbst). `true`, wenn etwas frei wurde.
+    pub fn release_idle(&mut self, keep: Duration) -> bool {
+        let old = self.last.as_ref().is_some_and(|last| last.taken.elapsed() >= keep);
+        if old {
+            self.last = None;
+        }
+        old
     }
 
     pub fn take(&mut self, request: &ScreenshotRequest) -> Result<ScreenshotResult> {
@@ -89,7 +105,7 @@ impl<S: ScreenSource, D: Desktop> ScreenshotPipeline<S, D> {
             None => (false, None, None),
         };
         let path = saved.path.to_string_lossy().into_owned();
-        self.last = Some(LastShot { path: path.clone(), image });
+        self.last = Some(LastShot { path: path.clone(), image, taken: Instant::now() });
         Ok(ScreenshotResult {
             path,
             width: captured.region.width,
